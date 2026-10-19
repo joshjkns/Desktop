@@ -4045,7 +4045,15 @@ impl AppView {
                             RadioGroup::horizontal("theme-choice")
                                 .children(THEME_CHOICES.into_iter().map(|choice| {
                                     let description = match choice {
-                                        ThemeChoice::System => "Follow macOS",
+                                        ThemeChoice::System => {
+                                            if cfg!(target_os = "macos") {
+                                                "Follow macOS"
+                                            } else if cfg!(target_os = "windows") {
+                                                "Follow Windows"
+                                            } else {
+                                                "Follow system"
+                                            }
+                                        }
                                         ThemeChoice::Dark => "Warm, muted",
                                         ThemeChoice::Oled => "True black",
                                         ThemeChoice::Light => "Bright, clear",
