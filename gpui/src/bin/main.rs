@@ -73,6 +73,7 @@ fn main() {
                 wallpaper,
                 vibrancy,
                 stored.window_opacity / 100.0,
+                stored.accent,
                 Some(window),
                 cx,
             );

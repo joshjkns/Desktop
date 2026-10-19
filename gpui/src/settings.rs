@@ -60,6 +60,9 @@ struct StoredSettings {
     overlay_corner: String,
     #[serde(default = "default_theme")]
     theme: String,
+    /// User-picked accent as [r, g, b]; `None` follows the theme's own accent.
+    #[serde(default)]
+    accent: Option<[u8; 3]>,
     #[serde(default = "default_opacity")]
     window_opacity: f32,
     #[serde(default)]
@@ -98,6 +101,7 @@ impl Default for StoredSettings {
             overlay_corner: default_corner(),
             dynamic_hex: None,
             theme: default_theme(),
+            accent: None,
             window_opacity: default_opacity(),
             panel_blur: 0.0,
             dynamic_vibrancy: default_vibrancy(),
@@ -123,6 +127,8 @@ pub struct Settings {
     pub overlay_sound: bool,
     pub overlay_corner: OverlayCorner,
     pub theme: ThemeChoice,
+    /// User-picked accent; `None` follows the active theme's own accent.
+    pub accent: Option<(u8, u8, u8)>,
     pub window_opacity: f32,
     pub panel_blur: f32,
     pub dynamic_vibrancy: f32,
@@ -137,6 +143,7 @@ impl Default for Settings {
 fn theme_from_str(s: &str) -> ThemeChoice {
     match s {
         "system" => ThemeChoice::System,
+        "oled" => ThemeChoice::Oled,
         "light" => ThemeChoice::Light,
         "dynamic" => ThemeChoice::Dynamic,
         _ => ThemeChoice::Dark,
@@ -147,6 +154,7 @@ fn theme_to_str(choice: ThemeChoice) -> &'static str {
     match choice {
         ThemeChoice::System => "system",
         ThemeChoice::Dark => "dark",
+        ThemeChoice::Oled => "oled",
         ThemeChoice::Light => "light",
         ThemeChoice::Dynamic => "dynamic",
     }
@@ -174,6 +182,7 @@ impl Settings {
             overlay_sound: stored.overlay_sound,
             overlay_corner: OverlayCorner::parse(&stored.overlay_corner),
             theme: theme_from_str(&stored.theme),
+            accent: stored.accent.map(|[r, g, b]| (r, g, b)),
             window_opacity: stored.window_opacity.clamp(MIN_OPACITY, 100.0),
             panel_blur: stored.panel_blur.clamp(0.0, MAX_BLUR),
             dynamic_vibrancy: stored.dynamic_vibrancy.clamp(0.0, MAX_VIBRANCY),
@@ -199,6 +208,7 @@ impl Settings {
             overlay_sound: self.overlay_sound,
             overlay_corner: self.overlay_corner.as_str().to_string(),
             theme: theme_to_str(self.theme).to_string(),
+            accent: self.accent.map(|(r, g, b)| [r, g, b]),
             window_opacity: self.window_opacity,
             panel_blur: self.panel_blur,
             dynamic_vibrancy: self.dynamic_vibrancy,

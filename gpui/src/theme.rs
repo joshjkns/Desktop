@@ -13,8 +13,10 @@
 //! slider can call [`apply_choice`] per-tick with no JSON regen (mirrors
 //! `applyDynamicVibrancy`'s no-transition live preview).
 
-use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
+use gpui_kit::component::{ActiveTheme as _, Theme, ThemeColor, ThemeMode};
 use gpui_kit::{App, Hsla, Window};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// The theme choices the app offers: system follow + Matt dark (default) +
 /// Matt light + wallpaper Dynamic.
@@ -25,6 +27,8 @@ pub enum ThemeChoice {
     /// Matt dark shell (the app's default look).
     #[default]
     Dark,
+    /// Matt dark shell with true-black surfaces, for OLED panels.
+    Oled,
     /// Matt light shell.
     Light,
     /// Wallpaper-derived accent ramp over the dark shell.
@@ -36,6 +40,7 @@ impl ThemeChoice {
         match self {
             ThemeChoice::System => "System",
             ThemeChoice::Dark => "Dark",
+            ThemeChoice::Oled => "OLED",
             ThemeChoice::Light => "Light",
             ThemeChoice::Dynamic => "Dynamic",
         }
@@ -280,7 +285,6 @@ pub fn spawn_wallpaper_watcher(
     view: &gpui_kit::Entity<crate::app::AppView>,
     window: &gpui_kit::AnyWindowHandle,
 ) {
-    use std::time::Duration;
     let view = view.downgrade();
     let window = *window;
     cx.spawn(async move |cx| {
@@ -431,12 +435,14 @@ fn dark_ramp(hue: f32, vibrancy: f32) -> (Hsla, Hsla, Hsla, Hsla, Hsla) {
 /// the Matt/Dynamic palette onto the public color fields.
 ///
 /// `wallpaper_hex` is the sampled dominant color for Dynamic; `None` uses
-/// the fallback green. `vibrancy` is 0–200, 100 = as designed.
+/// the fallback green. `vibrancy` is 0–200, 100 = as designed. `picked` is
+/// the user's accent override: it wins over every theme's own accent.
 pub fn apply_choice(
     choice: ThemeChoice,
     wallpaper_hex: Option<(u8, u8, u8)>,
     vibrancy: f32,
     opacity: f32,
+    picked: Option<(u8, u8, u8)>,
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
@@ -447,9 +453,9 @@ pub fn apply_choice(
         // Dynamic tint surviving into System.
         Theme::sync_system_appearance(window, cx);
         if cx.theme().mode.is_dark() {
-            paint_matt(false, MATT_ACCENT, vibrancy, wallpaper_hex, cx);
+            paint_matt(false, MATT_ACCENT, vibrancy, picked, wallpaper_hex, cx);
         } else {
-            paint_matt(true, MATT_LIGHT_ACCENT, vibrancy, wallpaper_hex, cx);
+            paint_matt(true, MATT_LIGHT_ACCENT, vibrancy, picked, wallpaper_hex, cx);
         }
         set_surface_opacity(opacity, cx);
         return;
@@ -464,10 +470,11 @@ pub fn apply_choice(
     match choice {
         ThemeChoice::Dynamic => {
             let (hue, sat, light) = hex_to_hsl(wallpaper_hex.unwrap_or(DYNAMIC_FALLBACK));
-            paint_dynamic(hue, sat, light, vibrancy, cx);
+            paint_dynamic(hue, sat, light, vibrancy, picked, cx);
         }
-        ThemeChoice::Dark => paint_matt(false, MATT_ACCENT, vibrancy, wallpaper_hex, cx),
-        ThemeChoice::Light => paint_matt(true, MATT_LIGHT_ACCENT, vibrancy, wallpaper_hex, cx),
+        ThemeChoice::Dark => paint_matt(false, MATT_ACCENT, vibrancy, picked, wallpaper_hex, cx),
+        ThemeChoice::Oled => paint_oled(vibrancy, picked, cx),
+        ThemeChoice::Light => paint_matt(true, MATT_LIGHT_ACCENT, vibrancy, picked, wallpaper_hex, cx),
         ThemeChoice::System => unreachable!(),
     }
     set_surface_opacity(opacity, cx);
@@ -481,27 +488,82 @@ pub fn set_surface_opacity(opacity: f32, cx: &mut App) {
     });
 }
 
+/// The accent and the ink that sits on it, at this vibrancy. Ink is dark on
+/// light accents and near-white on dark ones — same luminance rule as
+/// `accentCssFromHex`.
+fn accent_and_ink(accent_hsl: (f32, f32, f32), vibrancy: f32) -> (Hsla, Hsla) {
+    let (hue, sat, light) = accent_hsl;
+    let scale = (vibrancy / 100.0).clamp(0.0, crate::settings::MAX_VIBRANCY / 100.0);
+    let sat_scaled = |s: f32| (s * scale).clamp(0.0, 1.0);
+    let accent = hsla(hue, sat_scaled(sat), light);
+    let (r, g, b) = hsl_to_rgb(hue, sat_scaled(sat), light);
+    let ink = if 0.299 * r + 0.587 * g + 0.114 * b > 0.55 {
+        hsla(hue, sat_scaled(0.30), 0.08)
+    } else {
+        hsla(hue, sat_scaled(0.15), 0.94)
+    };
+    (accent, ink)
+}
+
+/// Saturation/lightness a picked accent is generated at: enough to read as a
+/// color on a dark shell without turning pastel or muddy.
+const PICKED_SAT: f32 = 0.80;
+const PICKED_LIGHT: f32 = 0.62;
+
+/// Accent stored when the user picks `hue360` on the ring.
+pub fn picked_accent(hue360: f32) -> (u8, u8, u8) {
+    let (r, g, b) = hsl_to_rgb(hue360, PICKED_SAT, PICKED_LIGHT);
+    let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    (to_u8(r), to_u8(g), to_u8(b))
+}
+
+/// The same accent as a color, for painting the ring's dots. One function
+/// pair, so the swatch the user clicks is exactly the color they get.
+pub fn picked_accent_hsla(hue360: f32) -> Hsla {
+    let (r, g, b) = picked_accent(hue360);
+    rgb_to_hsla((r, g, b))
+}
+
+/// Ink that reads on an arbitrary accent: near-black or near-white, whichever
+/// contrasts more. Used for user-picked accents, which carry no theme hue.
+fn readable_ink(accent: Hsla) -> Hsla {
+    let dark = rgb_to_hsla((16, 16, 18));
+    let light = rgb_to_hsla((250, 250, 250));
+    if contrast(dark, accent) >= contrast(light, accent) {
+        dark
+    } else {
+        light
+    }
+}
+
+/// The accent a palette paints: the user's picked color when there is one
+/// (verbatim — a picked color must not be re-saturated by the vibrancy
+/// slider), otherwise the theme's own accent at the current vibrancy.
+fn resolved_accent(
+    default_hsl: (f32, f32, f32),
+    vibrancy: f32,
+    picked: Option<(u8, u8, u8)>,
+) -> (Hsla, Hsla) {
+    match picked {
+        Some(rgb) => {
+            let accent = rgb_to_hsla(rgb);
+            (accent, readable_ink(accent))
+        }
+        None => accent_and_ink(default_hsl, vibrancy),
+    }
+}
+
 /// Matt palette: exact `App.css` tokens — near-neutral surfaces, ONLY the
 /// accent carrying hue. `is_light` selects the flipped light shell.
 fn paint_matt(
     is_light: bool,
     accent_hsl: (f32, f32, f32),
     vibrancy: f32,
+    picked: Option<(u8, u8, u8)>,
     _wallpaper_hex: Option<(u8, u8, u8)>,
     cx: &mut App,
 ) {
-    let (hue, sat, light) = accent_hsl;
-    let scale = (vibrancy / 100.0).clamp(0.0, crate::settings::MAX_VIBRANCY / 100.0);
-    let sat_scaled = |s: f32| (s * scale).clamp(0.0, 1.0);
-    let accent = hsla(hue, sat_scaled(sat), light);
-    // Accent ink: dark text on light accents, near-white on dark ones —
-    // same luminance rule as `accentCssFromHex`.
-    let (r, g, b) = hsl_to_rgb(hue, sat_scaled(sat), light);
-    let accent_ink = if 0.299 * r + 0.587 * g + 0.114 * b > 0.55 {
-        hsla(hue, sat_scaled(0.30), 0.08)
-    } else {
-        hsla(hue, sat_scaled(0.15), 0.94)
-    };
+    let (accent, accent_ink) = resolved_accent(accent_hsl, vibrancy, picked);
 
     // Exact `App.css` tokens per shell; the two shells never share a
     // side of this branch (sharing is what split Light in half before).
@@ -524,6 +586,30 @@ fn paint_matt(
             rgb_to_hsla((247, 247, 247)), // --text #f7f7f7
         )
     };
+    paint_shared(
+        bg, sidebar, border, muted, muted_fg, fg, accent, accent_ink, cx,
+    );
+}
+
+/// OLED shell surfaces: `(background, sidebar, border, muted fill,
+/// muted foreground, text)`. Pure black where the dark shell uses
+/// near-black, so an OLED panel lights only the pixels carrying information;
+/// everything above black stays one step up so structure is still visible.
+fn oled_shell() -> (Hsla, Hsla, Hsla, Hsla, Hsla, Hsla) {
+    (
+        rgb_to_hsla((0, 0, 0)),       // background: true black
+        rgb_to_hsla((0, 0, 0)),       // sidebar
+        rgb_to_hsla((32, 32, 34)),    // border — the only separation on black
+        rgb_to_hsla((24, 24, 26)),    // muted fill (badges, hover chips)
+        rgb_to_hsla((150, 150, 156)), // muted foreground
+        rgb_to_hsla((242, 242, 242)), // text
+    )
+}
+
+/// OLED palette: the Matt accent on true-black surfaces.
+fn paint_oled(vibrancy: f32, picked: Option<(u8, u8, u8)>, cx: &mut App) {
+    let (accent, accent_ink) = resolved_accent(MATT_ACCENT, vibrancy, picked);
+    let (bg, sidebar, border, muted, muted_fg, fg) = oled_shell();
     paint_shared(
         bg, sidebar, border, muted, muted_fg, fg, accent, accent_ink, cx,
     );
@@ -613,8 +699,21 @@ fn dynamic_palette(hue: f32, sat: f32, light: f32, vibrancy: f32) -> DynamicPale
     DynamicPalette { bg, sidebar, surface, border, muted_fg, fg, accent, accent_ink }
 }
 
-fn paint_dynamic(hue: f32, sat: f32, light: f32, vibrancy: f32, cx: &mut App) {
-    let p = dynamic_palette(hue, sat, light, vibrancy);
+fn paint_dynamic(
+    hue: f32,
+    sat: f32,
+    light: f32,
+    vibrancy: f32,
+    picked: Option<(u8, u8, u8)>,
+    cx: &mut App,
+) {
+    let mut p = dynamic_palette(hue, sat, light, vibrancy);
+    // A picked accent replaces the wallpaper-derived one; its ink follows the
+    // same readability rule so badges stay legible on any color.
+    if let Some(rgb) = picked {
+        p.accent = rgb_to_hsla(rgb);
+        p.accent_ink = readable_ink(p.accent);
+    }
     // Every surface carries the wallpaper hue (mirrors the Tauri Dynamic
     // ramp, where ink/sidebar/card all hold the accent hue) — pinning `bg`
     // to neutral is what left the content area flat black next to a tinted
@@ -663,6 +762,223 @@ fn paint_shared(
         c.scrollbar_thumb = border;
         c.scrollbar_thumb_hover = muted;
     });
+}
+
+/// Crossfade length for a theme switch — the same 380ms the web app puts on
+/// its theme tokens (`App.css`), so a native switch reads like the web one.
+pub const THEME_FADE_MS: u64 = 380;
+
+/// Frame step of that crossfade (~60fps).
+const THEME_FADE_STEP_MS: u64 = 16;
+
+/// Only the newest crossfade may write colors. A switch landing mid-fade
+/// bumps this and the older animator stops instead of fighting it for the
+/// palette.
+static THEME_FADE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Shortest-arc hue interpolation: accents cross the color wheel the short
+/// way, so orange → Dynamic-green never sweeps through the blues between.
+fn lerp_hsla(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    let mut hue_delta = to.h - from.h;
+    if hue_delta > 0.5 {
+        hue_delta -= 1.0;
+    } else if hue_delta < -0.5 {
+        hue_delta += 1.0;
+    }
+    Hsla {
+        h: (from.h + hue_delta * t).rem_euclid(1.0),
+        s: from.s + (to.s - from.s) * t,
+        l: from.l + (to.l - from.l) * t,
+        a: from.a + (to.a - from.a) * t,
+    }
+}
+
+/// Every palette token interpolated. The field list mirrors `ThemeColor`
+/// exactly: a token added upstream that is missing here would sit at the old
+/// color through the fade and snap at the end.
+fn lerp_colors(from: ThemeColor, to: ThemeColor, t: f32) -> ThemeColor {
+    ThemeColor {
+        accent: lerp_hsla(from.accent, to.accent, t),
+        accent_foreground: lerp_hsla(from.accent_foreground, to.accent_foreground, t),
+        accordion: lerp_hsla(from.accordion, to.accordion, t),
+        background: lerp_hsla(from.background, to.background, t),
+        border: lerp_hsla(from.border, to.border, t),
+        button: lerp_hsla(from.button, to.button, t),
+        button_active: lerp_hsla(from.button_active, to.button_active, t),
+        button_foreground: lerp_hsla(from.button_foreground, to.button_foreground, t),
+        button_hover: lerp_hsla(from.button_hover, to.button_hover, t),
+        button_danger: lerp_hsla(from.button_danger, to.button_danger, t),
+        button_danger_active: lerp_hsla(from.button_danger_active, to.button_danger_active, t),
+        button_danger_foreground: lerp_hsla(from.button_danger_foreground, to.button_danger_foreground, t),
+        button_danger_hover: lerp_hsla(from.button_danger_hover, to.button_danger_hover, t),
+        button_info: lerp_hsla(from.button_info, to.button_info, t),
+        button_info_active: lerp_hsla(from.button_info_active, to.button_info_active, t),
+        button_info_foreground: lerp_hsla(from.button_info_foreground, to.button_info_foreground, t),
+        button_info_hover: lerp_hsla(from.button_info_hover, to.button_info_hover, t),
+        button_primary: lerp_hsla(from.button_primary, to.button_primary, t),
+        button_primary_active: lerp_hsla(from.button_primary_active, to.button_primary_active, t),
+        button_primary_foreground: lerp_hsla(from.button_primary_foreground, to.button_primary_foreground, t),
+        button_primary_hover: lerp_hsla(from.button_primary_hover, to.button_primary_hover, t),
+        button_secondary: lerp_hsla(from.button_secondary, to.button_secondary, t),
+        button_secondary_active: lerp_hsla(from.button_secondary_active, to.button_secondary_active, t),
+        button_secondary_foreground: lerp_hsla(from.button_secondary_foreground, to.button_secondary_foreground, t),
+        button_secondary_hover: lerp_hsla(from.button_secondary_hover, to.button_secondary_hover, t),
+        button_success: lerp_hsla(from.button_success, to.button_success, t),
+        button_success_active: lerp_hsla(from.button_success_active, to.button_success_active, t),
+        button_success_foreground: lerp_hsla(from.button_success_foreground, to.button_success_foreground, t),
+        button_success_hover: lerp_hsla(from.button_success_hover, to.button_success_hover, t),
+        button_warning: lerp_hsla(from.button_warning, to.button_warning, t),
+        button_warning_active: lerp_hsla(from.button_warning_active, to.button_warning_active, t),
+        button_warning_foreground: lerp_hsla(from.button_warning_foreground, to.button_warning_foreground, t),
+        button_warning_hover: lerp_hsla(from.button_warning_hover, to.button_warning_hover, t),
+        group_box: lerp_hsla(from.group_box, to.group_box, t),
+        group_box_foreground: lerp_hsla(from.group_box_foreground, to.group_box_foreground, t),
+        caret: lerp_hsla(from.caret, to.caret, t),
+        chart_1: lerp_hsla(from.chart_1, to.chart_1, t),
+        chart_2: lerp_hsla(from.chart_2, to.chart_2, t),
+        chart_3: lerp_hsla(from.chart_3, to.chart_3, t),
+        chart_4: lerp_hsla(from.chart_4, to.chart_4, t),
+        chart_5: lerp_hsla(from.chart_5, to.chart_5, t),
+        chart_bullish: lerp_hsla(from.chart_bullish, to.chart_bullish, t),
+        chart_bearish: lerp_hsla(from.chart_bearish, to.chart_bearish, t),
+        chart_grid: lerp_hsla(from.chart_grid, to.chart_grid, t),
+        danger: lerp_hsla(from.danger, to.danger, t),
+        danger_active: lerp_hsla(from.danger_active, to.danger_active, t),
+        danger_foreground: lerp_hsla(from.danger_foreground, to.danger_foreground, t),
+        danger_hover: lerp_hsla(from.danger_hover, to.danger_hover, t),
+        description_list_label: lerp_hsla(from.description_list_label, to.description_list_label, t),
+        description_list_label_foreground: lerp_hsla(from.description_list_label_foreground, to.description_list_label_foreground, t),
+        drag_border: lerp_hsla(from.drag_border, to.drag_border, t),
+        drop_target: lerp_hsla(from.drop_target, to.drop_target, t),
+        foreground: lerp_hsla(from.foreground, to.foreground, t),
+        info: lerp_hsla(from.info, to.info, t),
+        info_active: lerp_hsla(from.info_active, to.info_active, t),
+        info_foreground: lerp_hsla(from.info_foreground, to.info_foreground, t),
+        info_hover: lerp_hsla(from.info_hover, to.info_hover, t),
+        input: lerp_hsla(from.input, to.input, t),
+        link: lerp_hsla(from.link, to.link, t),
+        link_active: lerp_hsla(from.link_active, to.link_active, t),
+        link_hover: lerp_hsla(from.link_hover, to.link_hover, t),
+        list: lerp_hsla(from.list, to.list, t),
+        list_active: lerp_hsla(from.list_active, to.list_active, t),
+        list_active_border: lerp_hsla(from.list_active_border, to.list_active_border, t),
+        list_even: lerp_hsla(from.list_even, to.list_even, t),
+        list_head: lerp_hsla(from.list_head, to.list_head, t),
+        list_hover: lerp_hsla(from.list_hover, to.list_hover, t),
+        muted: lerp_hsla(from.muted, to.muted, t),
+        muted_foreground: lerp_hsla(from.muted_foreground, to.muted_foreground, t),
+        popover: lerp_hsla(from.popover, to.popover, t),
+        popover_foreground: lerp_hsla(from.popover_foreground, to.popover_foreground, t),
+        primary: lerp_hsla(from.primary, to.primary, t),
+        primary_active: lerp_hsla(from.primary_active, to.primary_active, t),
+        primary_foreground: lerp_hsla(from.primary_foreground, to.primary_foreground, t),
+        primary_hover: lerp_hsla(from.primary_hover, to.primary_hover, t),
+        progress_bar: lerp_hsla(from.progress_bar, to.progress_bar, t),
+        ring: lerp_hsla(from.ring, to.ring, t),
+        scrollbar: lerp_hsla(from.scrollbar, to.scrollbar, t),
+        scrollbar_thumb: lerp_hsla(from.scrollbar_thumb, to.scrollbar_thumb, t),
+        scrollbar_thumb_hover: lerp_hsla(from.scrollbar_thumb_hover, to.scrollbar_thumb_hover, t),
+        secondary: lerp_hsla(from.secondary, to.secondary, t),
+        secondary_active: lerp_hsla(from.secondary_active, to.secondary_active, t),
+        secondary_foreground: lerp_hsla(from.secondary_foreground, to.secondary_foreground, t),
+        secondary_hover: lerp_hsla(from.secondary_hover, to.secondary_hover, t),
+        selection: lerp_hsla(from.selection, to.selection, t),
+        sidebar: lerp_hsla(from.sidebar, to.sidebar, t),
+        sidebar_accent: lerp_hsla(from.sidebar_accent, to.sidebar_accent, t),
+        sidebar_accent_foreground: lerp_hsla(from.sidebar_accent_foreground, to.sidebar_accent_foreground, t),
+        sidebar_border: lerp_hsla(from.sidebar_border, to.sidebar_border, t),
+        sidebar_foreground: lerp_hsla(from.sidebar_foreground, to.sidebar_foreground, t),
+        sidebar_primary: lerp_hsla(from.sidebar_primary, to.sidebar_primary, t),
+        sidebar_primary_foreground: lerp_hsla(from.sidebar_primary_foreground, to.sidebar_primary_foreground, t),
+        skeleton: lerp_hsla(from.skeleton, to.skeleton, t),
+        slider_bar: lerp_hsla(from.slider_bar, to.slider_bar, t),
+        slider_thumb: lerp_hsla(from.slider_thumb, to.slider_thumb, t),
+        success: lerp_hsla(from.success, to.success, t),
+        success_foreground: lerp_hsla(from.success_foreground, to.success_foreground, t),
+        success_hover: lerp_hsla(from.success_hover, to.success_hover, t),
+        success_active: lerp_hsla(from.success_active, to.success_active, t),
+        switch: lerp_hsla(from.switch, to.switch, t),
+        switch_thumb: lerp_hsla(from.switch_thumb, to.switch_thumb, t),
+        tab: lerp_hsla(from.tab, to.tab, t),
+        tab_active: lerp_hsla(from.tab_active, to.tab_active, t),
+        tab_active_foreground: lerp_hsla(from.tab_active_foreground, to.tab_active_foreground, t),
+        tab_bar: lerp_hsla(from.tab_bar, to.tab_bar, t),
+        tab_bar_segmented: lerp_hsla(from.tab_bar_segmented, to.tab_bar_segmented, t),
+        tab_foreground: lerp_hsla(from.tab_foreground, to.tab_foreground, t),
+        table: lerp_hsla(from.table, to.table, t),
+        table_active: lerp_hsla(from.table_active, to.table_active, t),
+        table_active_border: lerp_hsla(from.table_active_border, to.table_active_border, t),
+        table_even: lerp_hsla(from.table_even, to.table_even, t),
+        table_head: lerp_hsla(from.table_head, to.table_head, t),
+        table_head_foreground: lerp_hsla(from.table_head_foreground, to.table_head_foreground, t),
+        table_foot: lerp_hsla(from.table_foot, to.table_foot, t),
+        table_foot_foreground: lerp_hsla(from.table_foot_foreground, to.table_foot_foreground, t),
+        table_hover: lerp_hsla(from.table_hover, to.table_hover, t),
+        table_row_border: lerp_hsla(from.table_row_border, to.table_row_border, t),
+        title_bar: lerp_hsla(from.title_bar, to.title_bar, t),
+        title_bar_border: lerp_hsla(from.title_bar_border, to.title_bar_border, t),
+        status_bar: lerp_hsla(from.status_bar, to.status_bar, t),
+        status_bar_border: lerp_hsla(from.status_bar_border, to.status_bar_border, t),
+        warning: lerp_hsla(from.warning, to.warning, t),
+        warning_active: lerp_hsla(from.warning_active, to.warning_active, t),
+        warning_hover: lerp_hsla(from.warning_hover, to.warning_hover, t),
+        warning_foreground: lerp_hsla(from.warning_foreground, to.warning_foreground, t),
+        overlay: lerp_hsla(from.overlay, to.overlay, t),
+        window_border: lerp_hsla(from.window_border, to.window_border, t),
+        red: lerp_hsla(from.red, to.red, t),
+        red_light: lerp_hsla(from.red_light, to.red_light, t),
+        green: lerp_hsla(from.green, to.green, t),
+        green_light: lerp_hsla(from.green_light, to.green_light, t),
+        blue: lerp_hsla(from.blue, to.blue, t),
+        blue_light: lerp_hsla(from.blue_light, to.blue_light, t),
+        yellow: lerp_hsla(from.yellow, to.yellow, t),
+        yellow_light: lerp_hsla(from.yellow_light, to.yellow_light, t),
+        magenta: lerp_hsla(from.magenta, to.magenta, t),
+        magenta_light: lerp_hsla(from.magenta_light, to.magenta_light, t),
+        cyan: lerp_hsla(from.cyan, to.cyan, t),
+        cyan_light: lerp_hsla(from.cyan_light, to.cyan_light, t),
+    }
+}
+
+/// Fade the palette from `from` to `to` over [`THEME_FADE_MS`], one
+/// `Theme::update` per frame, so every window repaints with the interpolated
+/// tokens. The caller applies the new theme first (this only rewrites colors),
+/// which keeps mode switches, font resolution, and token reconciliation on the
+/// existing path.
+///
+/// Skipped when the palettes already match or the OS asks for reduced motion —
+/// in both cases the caller's instant switch is the whole story.
+pub fn crossfade_colors(from: ThemeColor, to: ThemeColor, cx: &mut App) {
+    let seq = THEME_FADE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    if from == to || cx.reduce_motion() {
+        return;
+    }
+    // Put the starting palette back before returning: the caller has already
+    // applied the target, and letting one frame paint with it first shows up
+    // as a flash of the new theme before the fade begins.
+    Theme::update(cx, |theme| theme.colors = from);
+    let duration = Duration::from_millis(THEME_FADE_MS).as_secs_f32();
+    cx.spawn(async move |cx| {
+        let start = Instant::now();
+        loop {
+            if THEME_FADE_SEQ.load(Ordering::Relaxed) != seq {
+                return;
+            }
+            let t = (start.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
+            // Ease-out cubic: most of the color movement lands early, like the
+            // web transition, instead of crawling through the middle.
+            let eased = 1.0 - (1.0 - t).powi(3);
+            let colors = lerp_colors(from, to, eased);
+            cx.update(move |cx| Theme::update(cx, |theme| theme.colors = colors));
+            if t >= 1.0 {
+                return;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(THEME_FADE_STEP_MS))
+                .await;
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]
@@ -767,6 +1083,43 @@ mod tests {
             60.0 * ((r - g) / d + 4.0)
         };
         Hsla { h: ((h + 360.0) % 360.0) / 360.0, s: s.clamp(0.0, 1.0), l, a: 1.0 }
+    }
+
+    /// A palette fade must land exactly on both ends and cross the hue wheel
+    /// the short way — a long-way lerp reads as a flash of unrelated color
+    /// halfway through the switch.
+    #[test]
+    fn theme_crossfade_hits_both_ends_and_takes_the_short_hue_way() {
+        let from = ThemeColor {
+            accent: Hsla { h: 10.0 / 360.0, s: 0.8, l: 0.5, a: 1.0 },
+            ..ThemeColor::default()
+        };
+        let to = ThemeColor {
+            accent: Hsla { h: 350.0 / 360.0, s: 0.4, l: 0.3, a: 1.0 },
+            ..ThemeColor::default()
+        };
+        let start = lerp_colors(from, to, 0.0).accent;
+        assert!((start.h - from.accent.h).abs() < 1e-6 && (start.l - from.accent.l).abs() < 1e-6);
+        let end = lerp_colors(from, to, 1.0).accent;
+        assert!((end.h - to.accent.h).abs() < 1e-6, "end hue {} wanted {}", end.h, to.accent.h);
+        assert!((end.s - to.accent.s).abs() < 1e-6 && (end.l - to.accent.l).abs() < 1e-6);
+        // 10° → 350° is 20° across zero, not 340° the long way round.
+        let mid = lerp_colors(from, to, 0.5).accent.h;
+        assert!(mid.min(1.0 - mid) < 0.01, "mid hue {mid} should sit at zero");
+        // Tokens the switch does not touch hold their color through the fade.
+        assert_eq!(lerp_colors(from, to, 0.5).background, from.background);
+    }
+
+    /// OLED only earns its name if the background is *actually* black: any
+    /// near-black tint lights the whole panel. Text still has to be readable
+    /// on it, and the surfaces above black must stay distinguishable.
+    #[test]
+    fn oled_shell_is_true_black_and_still_readable() {
+        let (bg, _sidebar, border, _muted, muted_fg, fg) = oled_shell();
+        assert_eq!(hsl_to_rgb(0.0, bg.s, bg.l), (0.0, 0.0, 0.0), "background must be #000000");
+        assert!(contrast(fg, bg) >= 15.0, "text on black: {:.2}", contrast(fg, bg));
+        assert!(contrast(muted_fg, bg) >= 4.5, "muted text on black: {:.2}", contrast(muted_fg, bg));
+        assert!(luminance(border) > luminance(bg), "black needs a visible border");
     }
 
     /// The accent badge (app.rs `accent_badge`): the theme's text colour on
