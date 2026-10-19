@@ -11,7 +11,7 @@ fn main() {
         // Same palette the app paints: Dynamic, from the current wallpaper.
         // The accent the app last saved (sampling the wallpaper takes seconds).
         let accent = openmouse_gpui::settings::Settings::load().dynamic_hex;
-        theme::apply_choice(ThemeChoice::Dynamic, accent, 100.0, 1.0, None, cx);
+        theme::apply_choice(ThemeChoice::Dynamic, accent, 100.0, 1.0, None, None, cx);
         overlay::show(
             cx,
             None,
