@@ -74,7 +74,7 @@ use serde::Serialize;
 mod hid_descriptor;
 
 pub use hid_descriptor::CollectionInfo;
-use hid_descriptor::parse_report_descriptor;
+use hid_descriptor::{parse_report_descriptor, ReportLayout};
 
 /// Diagnostics hook. The host app points this at its own log (Tauri: `applog`).
 /// Unset, lines go to stderr.
@@ -404,6 +404,11 @@ pub struct HidInputReportPayload {
 struct OpenSplit {
     device: Mutex<hidapi::HidDevice>,
     stop: Arc<AtomicBool>,
+    /// What this interface's report descriptor declares. Knows which report ids
+    /// belong here (and how long their reports are) without another descriptor
+    /// read; empty when the platform cannot read descriptors, which callers
+    /// treat as "unknown", never as "declares nothing".
+    layout: ReportLayout,
 }
 
 struct OpenGroup {
@@ -473,6 +478,15 @@ const MAX_DESCRIPTOR_BYTES: usize = hidapi::MAX_REPORT_DESCRIPTOR_SIZE;
 static DESCRIPTORS: LazyLock<Mutex<HashMap<String, Vec<CollectionInfo>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Report-id layout of each interface's report descriptor, cached by path
+/// alongside `DESCRIPTORS`. Nothing described a device to the JS side with it,
+/// so it went unused: but it is what says which report ids an interface
+/// declares, which is the only reliable way to pick the interface a request
+/// belongs on and how long a feature report read has to be. See
+/// `ReportLayout::declares` / `feature_buffer_len`.
+static LAYOUTS: LazyLock<Mutex<HashMap<String, ReportLayout>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// The collections of one interface group, merged across its paths — the app
 /// presents a device's interfaces as one synthetic device (see
 /// `tauri-hid-device.ts`), so this is that device's `collections`.
@@ -515,12 +529,18 @@ fn interface_collections(api: &HidApi, infos: &[&hidapi::DeviceInfo]) -> Vec<Col
                             applog!("[hid] descriptor for {path}: unparsable: {error}");
                             None
                         }
-                        Ok((collections, _layout)) => Some(collections),
+                        Ok((collections, layout)) => Some((collections, layout)),
                     },
                 },
             }
         };
-        let collections = parsed.unwrap_or_default();
+        let collections = parsed
+            .as_ref()
+            .map(|(collections, _)| collections.clone())
+            .unwrap_or_default();
+        if let Some((_, layout)) = parsed {
+            LAYOUTS.lock().insert(path.clone(), layout);
+        }
         if !collections.is_empty() {
             applog!(
                 "[hid] descriptor for {path}: {} collection(s)",
@@ -860,7 +880,7 @@ pub fn hid_open(
             match api.open_path(&c_path) {
                 Ok(device) => {
                     applog!("[hid] hid_open: successfully opened: {path}");
-                    opened.push(device);
+                    opened.push((path.clone(), device));
                 }
                 Err(error) => {
                     applog!("[hid] hid_open: failed to open {path}: {error}");
@@ -881,11 +901,13 @@ pub fn hid_open(
     let last_reply = Arc::new(Mutex::new(None));
     let mut splits = Vec::new();
     let mut readers = Vec::new();
-    for (index, device) in devices.into_iter().enumerate() {
+    for (index, (path, device)) in devices.into_iter().enumerate() {
         let stop = Arc::new(AtomicBool::new(false));
+        let layout = LAYOUTS.lock().get(&path).cloned().unwrap_or_default();
         let split = Arc::new(OpenSplit {
             device: Mutex::new(device),
             stop: stop.clone(),
+            layout,
         });
         readers.push(spawn_reader(
             sink.clone(),
@@ -1291,7 +1313,7 @@ pub fn hid_get_input_report(
     applog!("[hid] hid_get_input_report {vendor_id:04x}:{product_id:04x} reportId=0x{report_id:02x} length={length}");
     let result = with_open_group(registry, vendor_id, product_id, |group| {
         let mut result: Option<Vec<u8>> = None;
-        let outcome = try_each(&group.splits, &group.routes, &group.silent, report_id, |device| {
+        let outcome = try_each(&group.splits, &group.routes, &group.silent, report_id, false, |device, _layout| {
             let mut buffer = vec![0u8; length + 1];
             buffer[0] = report_id;
             let read = device
@@ -1321,8 +1343,16 @@ pub fn hid_get_feature_report(
     applog!("[hid] hid_get_feature_report {vendor_id:04x}:{product_id:04x} reportId=0x{report_id:02x} length={length}");
     let result = with_open_group(registry, vendor_id, product_id, |group| {
         let mut result: Option<Vec<u8>> = None;
-        let outcome = try_each(&group.splits, &group.routes, &group.silent, report_id, |device| {
-            let mut buffer = vec![0u8; length + 1];
+        let outcome = try_each(&group.splits, &group.routes, &group.silent, report_id, true, |device, layout| {
+            // `length` is the caller's idea of how much to ask for and is often
+            // far too small: the adapter in this app passes a flat 90 for every
+            // feature read, while a device can declare a much longer report
+            // under the same id family — Endgame Gear's OP1 8K declares its
+            // config report 0xa0 as 1040 payload bytes, and asking Windows for
+            // 90 of them fails outright (ERROR_INVALID_PARAMETER) instead of
+            // truncating. The descriptor knows the real length, so use it: the
+            // larger of the two, never smaller than what the caller asked for.
+            let mut buffer = vec![0u8; feature_read_len(layout, report_id, length)];
             buffer[0] = report_id;
             let read = device
                 .get_feature_report(&mut buffer)
@@ -1394,6 +1424,22 @@ fn with_open_group<T>(
     operation(group)
 }
 
+/// Every split index, with the interfaces whose descriptor declares the report
+/// in question first, in their original order otherwise. An interface that
+/// cannot carry a report is what a device's *sibling* collections are on a
+/// composite device, and trying one of them first is not merely wasted: the
+/// write is *accepted* there while its firmware never forwards it, so
+/// first-accept-wins returned success while the device never saw the command.
+/// When no interface's descriptor is known (a platform where descriptors cannot
+/// be read) every flag is false and nothing is reordered.
+fn declaring_first(declares: &[bool]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..declares.len()).collect();
+    // Stable: equal keys (every interface declaring it, or none) keep the
+    // ranked enumeration order the rest of this file relies on.
+    order.sort_by_key(|index| !declares[*index]);
+    order
+}
+
 /// Sends one report to the group's interfaces.
 ///
 /// With `fan_out` — which is Razer only, mirroring OpenMouse-Bridge: its
@@ -1411,9 +1457,13 @@ fn with_open_group<T>(
 /// HID++ control interface that should not be written to through its sibling
 /// collections.
 ///
-/// (The general form of the bridge's rule — parse each interface's report
-/// descriptor and route by what it declares — is the right eventual shape for
-/// this app too; it needs descriptor parsing this file does not have yet.)
+/// Ordering comes from the descriptors (see `declaring_first`), so the
+/// interface a report id belongs to is tried before ones that cannot carry it.
+/// The error returned when everything fails is the one from an interface that
+/// *does* declare the report — the sibling collections' "Incorrect function"
+/// says only that they have no such report, which is why the message the user
+/// saw named a mouse collection while the vendor collection's real failure went
+/// unreported.
 fn send_each(
     splits: &[Arc<OpenSplit>],
     frame: &[u8],
@@ -1422,9 +1472,17 @@ fn send_each(
 ) -> Result<(), String> {
     let mut sent = false;
     let mut last_error = None;
-    for (index, split) in splits.iter().enumerate() {
+    let mut declaring_error = None;
+    let report_id = frame.first().copied().unwrap_or(0);
+    let declares: Vec<bool> = splits
+        .iter()
+        .map(|split| split.layout.declares(report_id, feature))
+        .collect();
+    for index in declaring_first(&declares) {
+        let split = &splits[index];
+        let declares = declares[index];
         applog!(
-            "[hid] send_each: split {index}/{} waiting for lock…",
+            "[hid] send_each: split {index}/{} waiting for lock… (declares 0x{report_id:02x}: {declares})",
             splits.len()
         );
         let device = split.device.lock();
@@ -1433,6 +1491,7 @@ fn send_each(
         } else {
             device.write(frame).map(|_| ())
         };
+        applog!("[hid] send_each: split {index} returned: {outcome:?}");
         match outcome {
             Ok(_) => {
                 sent = true;
@@ -1440,13 +1499,20 @@ fn send_each(
                     return Ok(());
                 }
             }
-            Err(error) => last_error = Some(error.to_string()),
+            Err(error) => {
+                if declares && declaring_error.is_none() {
+                    declaring_error = Some(error.to_string());
+                }
+                last_error = Some(error.to_string());
+            }
         }
     }
     if sent {
         Ok(())
     } else {
-        Err(last_error.unwrap_or_else(|| "No HID interface accepted the request.".to_string()))
+        Err(declaring_error
+            .or(last_error)
+            .unwrap_or_else(|| "No HID interface accepted the request.".to_string()))
     }
 }
 
@@ -1497,12 +1563,29 @@ fn is_unprocessed_echo(reply: &[u8], last_sent: Option<&Vec<u8>>) -> bool {
     }
 }
 
+/// Buffer size for a feature-report read of `report_id` on one interface,
+/// including the report-id byte: whatever the caller asked for, raised to the
+/// length the interface's descriptor declares when that is longer.
+///
+/// Windows refuses a read shorter than the declared report
+/// (ERROR_INVALID_PARAMETER) and macOS/Linux truncate, so asking for too little
+/// is never merely "less data" — it is a hard failure on the platform this app
+/// runs on, which is how the Endgame Gear OP1 8K's 1040-byte config report
+/// became unreadable while every shorter read worked.
+fn feature_read_len(layout: &ReportLayout, report_id: u8, requested: usize) -> usize {
+    let wanted = requested.saturating_add(1);
+    layout
+        .feature_buffer_len(report_id)
+        .map_or(wanted, |declared| wanted.max(declared))
+}
+
 fn try_each(
     splits: &[Arc<OpenSplit>],
     routes: &Mutex<HashMap<u8, usize>>,
     silent: &Mutex<HashSet<usize>>,
     report_id: u8,
-    mut operation: impl FnMut(&hidapi::HidDevice) -> Result<SplitAnswer, String>,
+    feature: bool,
+    mut operation: impl FnMut(&hidapi::HidDevice, &ReportLayout) -> Result<SplitAnswer, String>,
 ) -> Result<(), String> {
     // Try whichever split answered this exact report id last time first —
     // see `OpenGroup::routes`. Falls through to the rest in order on a miss
@@ -1514,9 +1597,24 @@ fn try_each(
     // dropped entirely: a device that has since been replugged deserves
     // another chance, so when every split is marked silent the slate is wiped
     // instead of leaving nothing to try.
-    let candidates: Vec<usize> = (0..splits.len())
+    let mut candidates: Vec<usize> = (0..splits.len())
         .filter(|index| !known_silent.contains(index))
         .collect();
+    // Within each of those groups, an interface whose descriptor declares this
+    // report id comes first: it is the one that can answer, and asking the
+    // others first is what made a feature read report "Incorrect function"
+    // from a collection that never had the report (see `send_each`).
+    let declares: Vec<bool> = splits
+        .iter()
+        .map(|split| {
+            if feature {
+                split.layout.declares(report_id, true)
+            } else {
+                split.layout.declares_input(report_id)
+            }
+        })
+        .collect();
+    candidates.sort_by_key(|index| !declares[*index]);
     let order: Vec<usize> = if candidates.is_empty() {
         silent.lock().clear();
         (0..splits.len()).collect()
@@ -1530,15 +1628,17 @@ fn try_each(
     };
 
     let mut last_error = None;
+    let mut declaring_error = None;
     for index in order {
         let split = &splits[index];
         applog!(
             "[hid] try_each: split {index}/{} waiting for lock…",
             splits.len()
         );
+        let declares = declares[index];
         let device = split.device.lock();
         applog!("[hid] try_each: split {index} got lock, calling operation…");
-        let outcome = operation(&device);
+        let outcome = operation(&device, &split.layout);
         applog!("[hid] try_each: split {index} operation returned: {outcome:?}");
         match outcome {
             Ok(SplitAnswer::Answered) => {
@@ -1558,16 +1658,92 @@ fn try_each(
                     marked.clear();
                 }
             }
-            Err(error) => last_error = Some(error.to_string()),
+            Err(error) => {
+                if declares && declaring_error.is_none() {
+                    declaring_error = Some(error.to_string());
+                }
+                last_error = Some(error.to_string());
+            }
         }
     }
-    Err(last_error.unwrap_or_else(|| "No HID interface accepted the request.".to_string()))
+    Err(declaring_error
+        .or(last_error)
+        .unwrap_or_else(|| "No HID interface accepted the request.".to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// A descriptor shaped like Endgame Gear's OP1 8K vendor collection:
+    /// usage page 0xff01, feature report 0xa1 of 63 payload bytes and 0xa0 of
+    /// 1040, plus one input report on 0x03. Real numbers from the device's own
+    /// descriptor, which is what makes the read sizing below a regression test
+    /// rather than a guess.
+    fn egg_style_descriptor() -> Vec<u8> {
+        vec![
+            0x06, 0x01, 0xff, // Usage Page (0xFF01)
+            0x09, 0x02, // Usage (2)
+            0xa1, 0x01, // Collection (Application)
+            0x85, 0xa1, // Report ID (0xa1)
+            0x95, 0x3f, // Report Count (63)
+            0x75, 0x08, // Report Size (8)
+            0xb1, 0x02, // Feature (Data,Var,Abs)
+            0x85, 0xa0, // Report ID (0xa0)
+            0x96, 0x10, 0x04, // Report Count (1040)
+            0x75, 0x08, // Report Size (8)
+            0xb1, 0x02, // Feature (Data,Var,Abs)
+            0x85, 0x03, // Report ID (3)
+            0x95, 0x02, // Report Count (2)
+            0x75, 0x08, // Report Size (8)
+            0x81, 0x02, // Input (Data,Var,Abs)
+            0xc0, // End Collection
+        ]
+    }
+
+    /// The reported failure: the adapter asks for 90 bytes of every feature
+    /// report, which on Windows is a hard ERROR_INVALID_PARAMETER for the
+    /// 1040-byte config report rather than a short read. The descriptor's own
+    /// length has to win.
+    #[test]
+    fn feature_reads_are_sized_from_the_descriptor() {
+        let (_, layout) = parse_report_descriptor(&egg_style_descriptor()).unwrap();
+        assert_eq!(layout.feature_buffer_len(0xa1), Some(64));
+        assert_eq!(layout.feature_buffer_len(0xa0), Some(1041));
+        // The bug: 90 asked, 1041 needed.
+        assert_eq!(feature_read_len(&layout, 0xa0, 90), 1041);
+        // A longer request is still honoured, and a shorter report is not
+        // forced up to the longest one the interface declares.
+        assert_eq!(feature_read_len(&layout, 0xa0, 4096), 4097);
+        assert_eq!(feature_read_len(&layout, 0xa1, 90), 91);
+        // An interface that does not declare the report keeps the caller's
+        // request — the platform may still answer something.
+        assert_eq!(feature_read_len(&layout, 0x99, 90), 91);
+        assert!(layout.declares(0xa1, true));
+        assert!(!layout.declares(0xa1, false));
+        assert!(layout.declares_input(0x03));
+        assert!(!layout.declares_input(0xa1));
+        // A layout for an interface with no descriptor at all reorders nothing
+        // and sizes nothing.
+        let unknown = ReportLayout::default();
+        assert_eq!(feature_read_len(&unknown, 0xa0, 90), 91);
+    }
+
+    /// Which interface a report goes to: the one whose descriptor declares it,
+    /// before the sibling collections that cannot carry it (their "Incorrect
+    /// function" is what the user was shown while the real error was hidden).
+    #[test]
+    fn declaring_interfaces_are_tried_first() {
+        // The device's real shape: split 0 is the vendor collection declaring
+        // 0xa1, the rest are the mouse, keyboard, consumer-control and dongle
+        // collections, none of which declare it.
+        assert_eq!(declaring_first(&[true, false, false, false]), vec![0, 1, 2, 3]);
+        assert_eq!(declaring_first(&[false, true, false, true]), vec![1, 3, 0, 2]);
+        // No descriptors known: enumeration order is preserved untouched.
+        assert_eq!(declaring_first(&[false, false, false]), vec![0, 1, 2]);
+        assert_eq!(declaring_first(&[]), Vec::<usize>::new());
+    }
 
     /// `with_hid_api` must *refuse* a call that arrives while another one
     /// holds the handle, never wait for it. Waiting is what froze the app:

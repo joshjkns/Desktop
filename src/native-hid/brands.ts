@@ -135,9 +135,14 @@ export function candidatesForDevice(info: HidInterfaceInfo): BrandedCandidate[] 
       return false;
     }
   });
+  // The vendor fallback only exists for hosts that cannot read report
+  // descriptors. Where collections are known, a device no driver claims is not
+  // in the protocol and must not be offered (it showed up as "Unknown device").
   const eligible = claimed.length > 0
     ? claimed
-    : all.filter((candidate) => brandServesVendor(candidate.brand, info.vendorId));
+    : info.collections && info.collections.length > 0
+      ? []
+      : all.filter((candidate) => brandServesVendor(candidate.brand, info.vendorId));
   return eligible.slice().sort((a, b) => b.score(probe) - a.score(probe));
 }
 

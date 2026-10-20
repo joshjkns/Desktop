@@ -13,5 +13,6 @@ pub mod proc;
 pub mod profiles;
 pub mod settings;
 pub mod theme;
+pub mod update_check;
 #[cfg(windows)]
 mod wallpaper_win;

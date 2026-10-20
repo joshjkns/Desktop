@@ -85,6 +85,9 @@ fn main() {
         // change (mirrors `startDynamicAccentWatcher`). Focus-triggered
         // checks ride on the same path via GPUI's window focus events.
         openmouse_gpui::theme::spawn_wallpaper_watcher(cx, &view, &handle);
+        // Startup + 6-hour background check for a newer release (check +
+        // notify only — no download/install yet).
+        openmouse_gpui::update_check::spawn_update_watcher(cx, &view);
         // Game art prefetch: download missing covers on the background
         // executor (curl, 20s/file cap), then notify so cards repaint from
         // letter tiles to art. Non-fatal.

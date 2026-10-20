@@ -47,10 +47,10 @@ impl ThemeChoice {
     }
 }
 
-/// Matt accent `#f5975c` as HSL (matches `App.css :root --accent`).
-const MATT_ACCENT: (f32, f32, f32) = (27.0, 0.89, 0.66);
-/// Matt light-shell accent `#d46a32`.
-const MATT_LIGHT_ACCENT: (f32, f32, f32) = (19.0, 0.65, 0.51);
+/// Default accent `#5dde89` as HSL: the same green Dynamic falls back to.
+const MATT_ACCENT: (f32, f32, f32) = (140.5, 0.66, 0.62);
+/// Default accent on the light shell, a deeper green (`#2f9e5a`) that holds contrast on white.
+const MATT_LIGHT_ACCENT: (f32, f32, f32) = (143.0, 0.54, 0.40);
 /// Dynamic fallback green `#5dde89` (same as `DYNAMIC_FALLBACK_HEX`).
 const DYNAMIC_FALLBACK: (u8, u8, u8) = (93, 222, 137);
 
@@ -1004,9 +1004,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matt_orange_hue_is_recognizable() {
+    fn default_accent_hue_is_green() {
         let (h, _, _) = MATT_ACCENT;
-        assert!((20.0..35.0).contains(&h));
+        assert!((130.0..150.0).contains(&h));
     }
 
     #[test]

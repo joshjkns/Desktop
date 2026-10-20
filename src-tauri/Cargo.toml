@@ -35,3 +35,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+
+# Cross-crate inlining and a single codegen unit measurably speed up runtime
+# performance, at the cost of a slower release build. Worth it since this
+# ships as the end-user binary.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

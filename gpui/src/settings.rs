@@ -69,6 +69,17 @@ struct StoredSettings {
     panel_blur: f32,
     #[serde(default = "default_vibrancy")]
     dynamic_vibrancy: f32,
+    /// Last update version a toast already nagged about, so the 6-hour
+    /// background poll doesn't re-toast the same "an update is available"
+    /// notice forever while it sits uninstalled (mirrors `notifiedVersion`
+    /// in `src/lib/update-check.ts`).
+    #[serde(default)]
+    last_notified_update_version: Option<String>,
+    /// The "Link left & right" toggle, shared by every device that has one;
+    /// `None` until it is first touched (devices then start linked when their
+    /// two sides already match).
+    #[serde(default)]
+    link_left_right: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -105,6 +116,8 @@ impl Default for StoredSettings {
             window_opacity: default_opacity(),
             panel_blur: 0.0,
             dynamic_vibrancy: default_vibrancy(),
+            last_notified_update_version: None,
+            link_left_right: None,
         }
     }
 }
@@ -132,6 +145,8 @@ pub struct Settings {
     pub window_opacity: f32,
     pub panel_blur: f32,
     pub dynamic_vibrancy: f32,
+    pub last_notified_update_version: Option<String>,
+    pub link_left_right: Option<bool>,
 }
 
 impl Default for Settings {
@@ -186,6 +201,8 @@ impl Settings {
             window_opacity: stored.window_opacity.clamp(MIN_OPACITY, 100.0),
             panel_blur: stored.panel_blur.clamp(0.0, MAX_BLUR),
             dynamic_vibrancy: stored.dynamic_vibrancy.clamp(0.0, MAX_VIBRANCY),
+            last_notified_update_version: stored.last_notified_update_version,
+            link_left_right: stored.link_left_right,
         }
     }
 
@@ -212,6 +229,8 @@ impl Settings {
             window_opacity: self.window_opacity,
             panel_blur: self.panel_blur,
             dynamic_vibrancy: self.dynamic_vibrancy,
+            last_notified_update_version: self.last_notified_update_version.clone(),
+            link_left_right: self.link_left_right,
         };
         if let Ok(text) = serde_json::to_string_pretty(&stored) {
             let _ = std::fs::write(path, text);

@@ -1,13 +1,17 @@
 // A fake Finalmouse Starlight X for looking at the UI without hardware
-// (OPENMOUSE_MOCK=slx). Nothing here talks to a device: writes are accepted
+// (OPENMOUSE_MOCK=slx, ulx or x3; a trailing "!" hides the real devices). Nothing here talks to a device: writes are accepted
 // and only the in-memory status changes.
 
 export const isMockKey = (key: string) => key.startsWith("mock:");
 
-/** Which fake devices OPENMOUSE_MOCK asked for ("slx", "x3", or "slx,x3"). */
+/** Which fake devices OPENMOUSE_MOCK asked for ("slx", "ulx", "x3", or a comma list). */
 export const mockCandidates = (wanted: string) => [
   ...(wanted.includes("slx") ? [{
     info: { key: "mock:slx", vendorId: 0x361d, productId: 0x0100, productString: "Starlight X (mock)", manufacturerString: "Finalmouse", collections: [] },
+    brands: ["Finalmouse"],
+  }] : []),
+  ...(wanted.includes("ulx") ? [{
+    info: { key: "mock:ulx", vendorId: 0x361d, productId: 0x0100, productString: "Finalmouse UltralightX (mock)", manufacturerString: "Finalmouse", collections: [] },
     brands: ["Finalmouse"],
   }] : []),
   ...(wanted.includes("x3") ? [{
@@ -18,7 +22,36 @@ export const mockCandidates = (wanted: string) => [
 
 export const mockBrand = (key: string) => (key === "mock:x3" ? "Logitech" : "Finalmouse");
 
-export const mockStatus = (key: string) => (key === "mock:x3" ? mockX3() : mockSlx());
+export const mockStatus = (key: string) => (key === "mock:x3" ? mockX3() : key === "mock:ulx" ? mockUlx() : mockSlx());
+
+// Ultralight X as FinalmouseHidClient.readStatus() reports it: the whole
+// polling ladder and Motion Sync are adjustable, lift-off is the legacy 1/2 mm
+// pair, and none of the SLX-only click/TMR/PAW/profile fields are present.
+const mockUlx = () => ({
+  brand: "Finalmouse",
+  name: "Finalmouse UltralightX",
+  ui: { family: "finalmouse-ulx", defaultDisplayName: "Finalmouse UltralightX", hideUnsupportedPollingRates: true, forceShowBattery: true },
+  batteryPercent: 91,
+  batteryVoltageMv: 4080,
+  batteryState: "Discharging",
+  dpi: 1600,
+  pollingRateHz: 2000,
+  supportedPollingRates: [500, 1000, 2000, 4000, 8000],
+  activeProfile: null,
+  unitId: "ULX-0A1B2C3D",
+  connectionType: "Wireless",
+  connectionDetail: "2.4 GHz receiver · -52 dBm",
+  motionSync: true,
+  signalStrength: 3,
+  liftOffDistance: "Medium",
+  supportedLiftOffDistances: ["Medium", "High"],
+  liftOffScale: null,
+  finalmouseIsSlx: false,
+  finalmouseDongleLedMode: 1,
+  finalmouseTournamentScrollMode: 0,
+  finalmouseTournamentScrollTimeoutMs: 500,
+  firmware: ["Mouse 1.0.8", "Dongle RF 1.0.3", "Dongle USB 1.0.5"],
+});
 
 const mockX3 = () => ({
   brand: "Logitech",

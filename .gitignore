@@ -10,4 +10,5 @@ gpui/js/dist/
 
 # Rust build output for the native app and shared crates
 gpui/target/
+gpui/installer/target/
 crates/*/target/

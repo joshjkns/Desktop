@@ -354,6 +354,13 @@ impl HidService {
         })
     }
 
+    /// Preferences the JS layer needs when it lays controls out. Sent before a
+    /// connect; calls are served in order, so the connect sees them.
+    pub fn set_prefs(&self, link_left_right: Option<bool>) {
+        let args = serde_json::json!({ "linkLeftRight": link_left_right });
+        drop(self.call("setPrefs", Some(args.to_string()), |_| Ok(())));
+    }
+
     /// Product artwork for a device, from the same lookup the Tauri app uses.
     /// `name` is the name the device reports (receivers share product ids).
     pub fn device_image(&self, key: &str, name: &str) -> oneshot::Receiver<Result<DeviceArt, String>> {

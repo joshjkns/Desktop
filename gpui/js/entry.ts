@@ -12,7 +12,7 @@ import { DPI_MAX, DPI_MIN, DPI_PRESETS, DPI_STEP, GAMING_SURFACE_MODES } from ".
 import { withLogitechClient } from "../../src/native-hid/logitech-actions";
 import { LOGITECH_BUTTON_ACTIONS } from "@openmouse/protocol/drivers/logitech/onboard-profiles";
 import { applyGameProfile } from "../../src/lib/game-profiles";
-import { describeControls, writeControl, writeLighting } from "./controls";
+import { describeControls, setPrefs, writeControl, writeLighting } from "./controls";
 import { connectToInterface, listCandidateInterfaces, type CandidateInterface } from "../../src/native-hid/scan";
 
 let lastList = new Map<string, CandidateInterface>();
@@ -22,10 +22,15 @@ const mockWanted = (): string => String((globalThis as any).__mock ?? "");
 
 (globalThis as any).__api = {
   async listCandidates(): Promise<string> {
-    const candidates = await listCandidateInterfaces();
+    // A trailing "!" on OPENMOUSE_MOCK (e.g. "ulx!") lists only the fakes.
+    const candidates = mockWanted().endsWith("!") ? [] : await listCandidateInterfaces();
     candidates.push(...(mockCandidates(mockWanted()) as any[]));
     lastList = new Map(candidates.map((candidate) => [candidate.info.key, candidate]));
     return JSON.stringify(candidates);
+  },
+  async setPrefs(argsJson: string): Promise<string> {
+    setPrefs(JSON.parse(argsJson));
+    return "{}";
   },
   /** Artwork for a device: URL plus the box-relative placement `deviceArtStyle` computes in the Tauri app. */
   async deviceImage(argsJson: string): Promise<string> {

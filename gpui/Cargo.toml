@@ -7,6 +7,9 @@ edition = "2021"
 name = "openmouse-gpui"
 path = "src/bin/main.rs"
 
+[build-dependencies]
+winres = "0.1"
+
 [dependencies]
 gpui-kit = "0.7"
 anyhow = "1.0"
@@ -41,3 +44,11 @@ raw-window-handle = "0.6"
 # builds. The app's own crate stays unoptimized and quick to rebuild.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Cross-crate inlining and a single codegen unit measurably speed up GPUI's
+# layout/text/compositing work at runtime, at the cost of a slower release
+# build. Worth it since this ships as the end-user binary.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

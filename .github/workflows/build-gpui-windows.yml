@@ -45,8 +45,17 @@ jobs:
         run: cargo build --release
         working-directory: gpui
 
+      # Needs the app's release .exe to exist first: its build.rs embeds
+      # those bytes as the installer's payload (see gpui/installer/build.rs).
+      - name: Build installer
+        run: cargo build --release
+        working-directory: gpui/installer
+
+      - name: Rename installer artifact
+        run: cp gpui/installer/target/release/openmouse-installer.exe OpenMouseDesktopSetup.exe
+
       - uses: actions/upload-artifact@v4
         with:
           name: openmouse-gpui-windows
-          path: gpui/target/release/openmouse-gpui.exe
+          path: OpenMouseDesktopSetup.exe
           if-no-files-found: error

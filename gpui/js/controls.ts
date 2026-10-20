@@ -16,10 +16,17 @@ import type { DeviceCapabilities } from "../../src/native-hid/write";
 type Option = { value: string | number; label: string };
 type Control =
   | { id: string; label: string; description?: string; kind: "choice"; options: Option[]; current: string | number | null }
+  | { id: string; label: string; description?: string; kind: "stepped"; options: Option[]; current: string | number | null }
   | { id: string; label: string; description?: string; kind: "toggle"; current: boolean }
   | { id: string; label: string; description?: string; kind: "number"; min: number; max: number; step?: number; decimals?: number; unit?: string; zeroLabel?: string; current: number }
   | { id: string; label: string; description?: string; kind: "info"; current: string };
 type Section = { title: string; controls: Control[] };
+
+/** App preferences the layout depends on, pushed in by the host (`setPrefs`). */
+let linkLeftRight: boolean | null = null;
+export function setPrefs(prefs: { linkLeftRight?: boolean | null }) {
+  linkLeftRight = typeof prefs.linkLeftRight === "boolean" ? prefs.linkLeftRight : null;
+}
 
 const opts = (values: readonly (string | number)[]): Option[] => values.map((v) => ({ value: v, label: String(v) }));
 
@@ -70,7 +77,7 @@ function razerAndEgg(brand: string, s: any): Section[] {
         controls: (EGG_BUTTON_NAMES as readonly string[]).slice(0, s.eggMulticlickFilters.length).map((name, i) => ({
           id: `egg.debounce.${i}`,
           label: name,
-          kind: "choice" as const,
+          kind: "stepped" as const,
           options: [0, 1, 2, 4, 8, 12, 16].map((v) => ({ value: v, label: v === 0 ? "Off" : `${v} ms` })),
           current: s.eggMulticlickFilters?.[i] ?? 16,
         })),
@@ -234,7 +241,7 @@ function extras(s: any): Section[] {
     const rel = [{ value: 0, label: "Normal" }, { value: 1, label: "Early" }, { value: 2, label: "Late" }];
     // Edit both switches as one, or each on its own. Starts linked when they already match.
     const keys = ["ClickMode", "ClickRelease", "TmrThr", "TmrHyst"];
-    if (s.slxLinked === undefined) s.slxLinked = keys.every((k) => s[`finalmouse${k}L`] === s[`finalmouse${k}R`]);
+    if (s.slxLinked === undefined) s.slxLinked = linkLeftRight ?? keys.every((k) => s[`finalmouse${k}L`] === s[`finalmouse${k}R`]);
     const linked: boolean = s.slxLinked;
     out.push({ title: "Starlight X", controls: [{ id: "slx.link", label: "Link left & right", description: "Change both buttons together.", kind: "toggle", current: linked }] });
     for (const side of linked ? (["L"] as const) : (["L", "R"] as const)) {
@@ -324,7 +331,7 @@ function hits(s: any, brand: string): Section[] {
   const t = s.analogButtonTuning;
   if (brand !== "Logitech" || !t || !Array.isArray(t.buttons) || t.buttons.length === 0) return [];
   const same = (k: string) => t.buttons.every((b: any) => b[k] === t.buttons[0][k]);
-  if (s.hitsLinked === undefined) s.hitsLinked = t.buttons.length > 1 && ["actuation", "rapidTrigger", "haptics", "rapidTriggerEnabled"].every(same);
+  if (s.hitsLinked === undefined) s.hitsLinked = t.buttons.length > 1 && (linkLeftRight ?? ["actuation", "rapidTrigger", "haptics", "rapidTriggerEnabled"].every(same));
   const linked: boolean = s.hitsLinked && t.buttons.length > 1;
   const out: Section[] = [];
   if (t.buttons.length > 1) {
@@ -511,7 +518,7 @@ function performanceExtras(status: any, caps: DeviceCapabilities): Section[] {
         id: "perf.debounce",
         label: "Debounce",
         description: `Filters out physical switch bounce (0–${values[values.length - 1]} ms). Higher is steadier, slightly more click lag.`,
-        kind: "choice",
+        kind: "stepped",
         options: values.map((ms) => ({ value: ms, label: `${ms} ms` })),
         current: status.debounceMs,
       });

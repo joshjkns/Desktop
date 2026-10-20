@@ -10,7 +10,7 @@ use gpui_kit::component::Icon;
 use gpui_kit::component::slider::Slider;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{h_flex, ActiveTheme as _, Collapsible as _, Sizable as _, TitleBar};
+use gpui_kit::component::{h_flex, ActiveTheme as _, Collapsible as _, Disableable as _, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::time::Duration;
@@ -20,12 +20,15 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Deterministic (no RNG, no animation), and only regenerated when the
 /// window's character grid changes size.
 const ASCII_RAMP: &[u8] = b" .:-=+*x#%@";
-/// Cell width as a fraction of the font size. A monospace advance is ~0.6em;
-/// deliberately under that, so the trailing columns overflow the window and
-/// get clipped instead of leaving a strip of bare background on the right.
-const ASCII_CELL_RATIO: f32 = 0.57;
+/// Cell width as a fraction of the font size. Monospace advances run from
+/// ~0.55em (Consolas) to ~0.6em (Menlo, DejaVu); deliberately under all of
+/// them, so the trailing columns overflow the window and get clipped instead
+/// of leaving a strip of bare background on the right.
+const ASCII_CELL_RATIO: f32 = 0.5;
 /// Ink opacity at the corner the field starts from.
 const ASCII_ALPHA: f32 = 0.09;
+/// Alpha multiplier on the OLED theme, where the field would otherwise vanish.
+const ASCII_OLED_GAIN: f32 = 2.2;
 /// The field slides back in from the right whenever the theme changes.
 const ASCII_SWEEP_MS: u64 = 520;
 /// How far a row starts to the right of its resting place, in px.
@@ -120,7 +123,6 @@ fn ascii_background_rows(cols: usize, rows: usize) -> Vec<SharedString> {
     }
     out
 }
-
 /// Release stage label shown in the titlebar badge, mirroring
 /// `stageForVersion` in `src/lib/version-stage.ts`: 0.x → Alpha,
 /// 1.x → Beta, 2.x+ → Public.
@@ -463,6 +465,9 @@ pub struct AppView {
     toast_seq: u64,
     /// The Updates page's virtualized list (only the rows on screen are built).
     updates_list: ListState,
+    /// Newest version `update_check` has seen, if it's ahead of `APP_VERSION`.
+    update_available: Option<crate::update_check::UpdateInfo>,
+    checking_for_updates: bool,
     /// The on-screen game overlay while one is up.
     overlay: Option<AnyWindowHandle>,
     /// Newest scheduled presence update wins (Discord rate-limits them).
@@ -602,6 +607,8 @@ impl AppView {
             toast: None,
             toast_seq: 0,
             updates_list: ListState::new(crate::changelog::entries().len() + UPDATES_LEADING_ROWS, ListAlignment::Top, px(400.)),
+            update_available: None,
+            checking_for_updates: false,
             overlay: None,
             presence_seq: 0,
             startup_error: None,
@@ -656,6 +663,8 @@ impl Default for AppView {
             toast: None,
             toast_seq: 0,
             updates_list: ListState::new(crate::changelog::entries().len() + UPDATES_LEADING_ROWS, ListAlignment::Top, px(400.)),
+            update_available: None,
+            checking_for_updates: false,
             overlay: None,
             presence_seq: 0,
             startup_error: None,
@@ -1018,6 +1027,14 @@ impl AppView {
         }
         let Some(tile) = self.devices.tiles.get(self.devices.selected) else { return };
         let (key, brand) = (tile.key.clone(), tile.brand.clone());
+        // "Link left & right" is one preference for every device that has it.
+        if id.ends_with(".link") {
+            if let Some(linked) = value.as_bool() {
+                self.settings.link_left_right = Some(linked);
+                self.settings.save();
+                self.hid_service().set_prefs(Some(linked));
+            }
+        }
         self.devices.writing = Some(id.clone());
         self.devices.write_error = None;
         cx.notify();
@@ -1301,6 +1318,7 @@ impl AppView {
         self.devices.selected = index;
         cx.notify();
         let service = self.hid_service();
+        service.set_prefs(self.settings.link_left_right);
         let key = key.to_string();
         cx.spawn(async move |view, cx| {
             let connected = service.connect(&key).await;
@@ -1716,6 +1734,53 @@ impl AppView {
         cx.notify();
     }
 
+    /// Update watcher callback: a `latest.json` fetch landed, from either the
+    /// background poll or the manual "Check for updates" button. Stores the
+    /// result and, if it's newer than `APP_VERSION` and this version hasn't
+    /// already been nagged about, toasts once (mirrors
+    /// `runUpdateCheck`/`notifiedVersion` in `src/lib/update-check.ts`).
+    pub fn note_update_available(&mut self, info: crate::update_check::UpdateInfo, cx: &mut Context<Self>) {
+        let is_new = crate::update_check::is_newer(APP_VERSION, &info.version);
+        let should_toast = is_new
+            && self.settings.last_notified_update_version.as_deref() != Some(info.version.as_str());
+        self.update_available = is_new.then(|| info.clone());
+        if should_toast {
+            self.settings.last_notified_update_version = Some(info.version.clone());
+            self.settings.save();
+            self.show_toast(format!("OpenMouse Desktop v{} is available — see Updates.", info.version), false, cx);
+        }
+        cx.notify();
+    }
+
+    /// "Check for updates" button: runs a check right now (not waiting for
+    /// the next background-poll tick) and always surfaces *something* —
+    /// "up to date" included — since the user explicitly asked.
+    fn check_for_updates_now(&mut self, cx: &mut Context<Self>) {
+        if self.checking_for_updates {
+            return;
+        }
+        self.checking_for_updates = true;
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let info = cx.background_executor().spawn(async { crate::update_check::fetch_latest() }).await;
+            let _ = view.update(cx, |view, cx| {
+                view.checking_for_updates = false;
+                match info {
+                    // A manual click always wants an answer, even "nothing to
+                    // report" — `note_update_available` itself stays silent
+                    // once a version's already been nagged about.
+                    Some(info) if !crate::update_check::is_newer(APP_VERSION, &info.version) => {
+                        view.note_update_available(info, cx);
+                        view.show_toast("You're up to date.", false, cx);
+                    }
+                    Some(info) => view.note_update_available(info, cx),
+                    None => view.show_toast("Couldn't check for updates — check your connection.", true, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Repaint the active theme from current settings (theme + vibrancy).
     fn repaint_theme(&self, window: Option<&mut Window>, cx: &mut App) {
         // Dynamic repaints from the cached sample — passing None would reset
@@ -1744,7 +1809,6 @@ impl AppView {
     /// date on the left, changes grouped under New / Improved / Fixed on the
     /// right). One virtualized list, so only the rows on screen are built — the
     /// page used to rebuild every release on each scroll tick and pinned a core.
-    /// The version card is UI only for now: update checks aren't wired up yet.
     fn render_updates(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = PageColors {
             fg: cx.theme().foreground,
@@ -1752,13 +1816,65 @@ impl AppView {
             accent: cx.theme().primary,
             border: Hsla { a: 0.7, ..cx.theme().border },
         };
-        let notify = cx.listener(|this, _, _, cx| {
-            this.show_toast("Update checks aren't available yet.", false, cx);
-        });
-        let check_button = Button::new("check-updates").compact().label("Check for updates").on_click(notify).into_any_element();
+        let checking = self.checking_for_updates;
+        let on_click = cx.listener(|this, _, _, cx| this.check_for_updates_now(cx));
+        let check_button = Button::new("check-updates")
+            .compact()
+            .label("Check for updates")
+            .loading(checking)
+            .disabled(checking)
+            .on_click(on_click)
+            .into_any_element();
         // The click handler lives on the card's button, built here once per render
         // of the page (cheap); the list rows are built lazily below.
         let mut check_button = Some(check_button);
+        let mut update_banner = self.update_available.as_ref().map(|info| {
+            let notes = info.notes.clone().unwrap_or_default();
+            h_flex()
+                .gap_3()
+                .items_center()
+                .justify_between()
+                .p_4()
+                .mt_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(colors.accent)
+                .bg(Hsla { a: 0.08, ..colors.accent })
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors.fg)
+                                .child(format!("v{} is available", info.version)),
+                        )
+                        .children((!notes.is_empty()).then(|| div().text_xs().text_color(colors.muted).child(notes))),
+                )
+                .child(
+                    Button::new("view-release")
+                        .compact()
+                        .label("View release")
+                        .on_click(cx.listener(|_, _, _, _| {
+                            // Opens the GitHub release page for a manual download —
+                            // this pass is check + notify only, no in-app download/install.
+                            let _ = crate::proc::quiet(
+                                std::process::Command::new("cmd")
+                                    .args(["/C", "start", ""])
+                                    .arg("https://github.com/OpenMouse-Project/Desktop/releases/latest")
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null()),
+                            )
+                            .spawn();
+                        }))
+                        .into_any_element(),
+                )
+                .into_any_element()
+        });
 
         let entries = crate::changelog::entries();
         let list_state = self.updates_list.clone();
@@ -1772,6 +1888,7 @@ impl AppView {
                     .flex_col()
                     .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(c.fg).child("Updates"))
                     .child(div().text_sm().text_color(c.muted).child("Your version and what's changed"))
+                    .children(update_banner.take())
                     .into_any_element(),
                 1 => h_flex()
                     .gap_4()
@@ -1910,6 +2027,9 @@ impl AppView {
         }
         let font_family = cx.theme().mono_font_family.clone();
         let color = cx.theme().primary;
+        // On true black the same ink reads far fainter than on the lifted
+        // greys of the other themes, so it gets extra gain there.
+        let gain = if cx.theme().background.l < 0.03 { ASCII_OLED_GAIN } else { 1.0 };
         let total = self.ascii_rows.len();
         let rows: Vec<(SharedString, f32)> = self
             .ascii_rows
@@ -1959,7 +2079,7 @@ impl AppView {
                                         div()
                                             .flex_none()
                                             .text_color(Hsla {
-                                                a: ascii_cell_alpha(u, *position),
+                                                a: (ascii_cell_alpha(u, *position) * gain).min(1.0),
                                                 ..color
                                             })
                                             .child(SharedString::from(line[start..end].to_string())),
@@ -2071,9 +2191,6 @@ impl AppView {
             .pt_3()
             .pb_3()
             .gap_6()
-            .border_r_1()
-            .border_color(Hsla { a: 0.7, ..border })
-            .bg(Hsla { a: 0.35, ..cx.theme().sidebar })
             .child(nav)
             .child(div().flex_1())
             .child(footer)
@@ -2134,7 +2251,18 @@ impl AppView {
                     )
                     .child(format!("v{APP_VERSION} · {}", release_stage(APP_VERSION))),
             );
-        h_flex().items_center().gap_1().child(toggle).child(brand)
+        // The kit's bar is a Windows caption (drag) region, which turns clicks
+        // into window moves; occluding it makes the toggle a normal client hit.
+        // Collapsed, the sidebar strip is narrower than the name, so the text
+        // would straddle its edge; only the toggle stays over the strip.
+        h_flex().items_center().gap_1().child(
+            // Collapsed, the bar's 12px left inset is mirrored on the right so
+            // the button centres over the icon column below it.
+            div()
+                .occlude()
+                .when(collapsed, |slot| slot.w(px(SIDEBAR_COLLAPSED_W - 24.)).flex().justify_center())
+                .child(toggle),
+        ).when(!collapsed, |row| row.child(brand))
     }
 
     fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2246,7 +2374,7 @@ impl AppView {
             .chain(&r.tabs.buttons)
             .chain(&r.tabs.advanced)
             .flat_map(|s| s.controls.iter())
-            .filter(|c| c.kind == "number")
+            .filter(|c| c.kind == "number" || c.kind == "stepped")
             .cloned()
             .collect();
         for c in specs {
@@ -2254,9 +2382,20 @@ impl AppView {
             if self.control_sliders.contains_key(&key) {
                 continue;
             }
-            let (min, max) = (c.min.unwrap_or(0.0), c.max.unwrap_or(255.0));
-            let step = c.step.unwrap_or(1.0);
-            let start = c.current.as_f64().unwrap_or(min).clamp(min, max);
+            // A stepped control slides over the positions of its option list
+            // (the stops need not be evenly spaced); the write sends the
+            // option's own value.
+            let stepped: Option<Vec<serde_json::Value>> =
+                (c.kind == "stepped").then(|| c.options.iter().map(|o| o.value.clone()).collect());
+            let (min, max) = match &stepped {
+                Some(values) => (0.0, values.len().saturating_sub(1) as f64),
+                None => (c.min.unwrap_or(0.0), c.max.unwrap_or(255.0)),
+            };
+            let step = if stepped.is_some() { 1.0 } else { c.step.unwrap_or(1.0) };
+            let start = match &stepped {
+                Some(values) => values.iter().position(|v| *v == c.current).unwrap_or(0) as f64,
+                None => c.current.as_f64().unwrap_or(min).clamp(min, max),
+            };
             let slider = cx.new(|_| SliderState::new().min(0.0).max((max - min) as f32).step(step as f32).default_value((start - min) as f32));
             let id = c.id.clone();
             let places = c.decimals.unwrap_or(0);
@@ -2269,12 +2408,17 @@ impl AppView {
                 this.slider_seq += 1;
                 let seq = this.slider_seq;
                 let id = id.clone();
+                let stepped = stepped.clone();
                 cx.notify();
                 cx.spawn(async move |view, cx| {
                     cx.background_executor().timer(std::time::Duration::from_millis(350)).await;
                     let _ = view.update(cx, |this: &mut Self, cx| {
                         if this.slider_seq == seq {
-                            this.set_control(id, serde_json::json!(v), cx);
+                            let sent = match &stepped {
+                                Some(values) => values.get(v as usize).cloned().unwrap_or(serde_json::Value::Null),
+                                None => serde_json::json!(v),
+                            };
+                            this.set_control(id, sent, cx);
                         }
                     });
                 })
@@ -2283,6 +2427,33 @@ impl AppView {
             self._subscriptions.push(sub);
             self.control_sliders.insert(key, slider);
         }
+    }
+
+    /// A slider for a Buttons/Advanced/Performance control: accent-filled track
+    /// and thumb, with its value in a fixed-width pill so rows line up.
+    fn control_slider_row(slider: Option<Entity<SliderState>>, value: String, cx: &mut Context<Self>) -> AnyElement {
+        let accent = cx.theme().primary;
+        let fg = cx.theme().foreground;
+        let border = cx.theme().border;
+        h_flex()
+            .gap_3()
+            .items_center()
+            .children(slider.map(|s| div().w(px(220.)).child(Slider::new(&s).bg(accent).text_color(fg))))
+            .child(
+                div()
+                    .min_w(px(84.))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(Hsla { a: 0.7, ..border })
+                    .bg(Hsla { a: 0.05, ..fg })
+                    .text_sm()
+                    .text_center()
+                    .text_color(fg)
+                    .child(value),
+            )
+            .into_any_element()
     }
 
     /// One Buttons/Advanced control: label on the left, the control on the right.
@@ -2317,15 +2488,21 @@ impl AppView {
                 let live = slider_key.as_ref().and_then(|k| self.slider_live.get(k)).copied();
                 let now = live.or(c.current.as_f64()).unwrap_or(c.min.unwrap_or(0.0));
                 let slider = slider_key.and_then(|k| self.control_sliders.get(&k).cloned());
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .children(slider.map(|s| div().w(px(200.)).child(Slider::new(&s))))
-                    .child(div().min_w(px(76.)).text_right().text_color(fg).child(match (&c.zero_label, now <= c.min.unwrap_or(0.0)) {
-                        (Some(label), true) => label.clone(),
-                        _ => format!("{now:.places$}{unit}"),
-                    }))
-                    .into_any_element()
+                let shown = match (&c.zero_label, now <= c.min.unwrap_or(0.0)) {
+                    (Some(label), true) => label.clone(),
+                    _ => format!("{now:.places$}{unit}"),
+                };
+                Self::control_slider_row(slider, shown, cx)
+            }
+            "stepped" => {
+                let slider_key = self.devices.tiles.get(self.devices.selected).map(|t| format!("{}/{}", t.key, c.id));
+                let live = slider_key.as_ref().and_then(|k| self.slider_live.get(k)).copied();
+                let index = live
+                    .map(|v| v as usize)
+                    .or_else(|| c.options.iter().position(|o| o.value == c.current))
+                    .unwrap_or(0);
+                let slider = slider_key.and_then(|k| self.control_sliders.get(&k).cloned());
+                Self::control_slider_row(slider, c.options.get(index).map(|o| o.label.clone()).unwrap_or_default(), cx)
             }
             "choice" if c.options.len() <= 8 => {
                 let mut row = h_flex().gap_2().flex_wrap().justify_end();
@@ -3196,8 +3373,8 @@ impl AppView {
                     )
                     .child(div().text_sm().text_color(muted).child(match devices.tiles.len() {
                         0 => "No mouse connected".to_string(),
-                        1 => "1 mouse found".to_string(),
-                        n => format!("{n} mice found"),
+                        1 => "1 supported device found".to_string(),
+                        n => format!("{n} supported devices found"),
                     })),
             )
             .child(
@@ -3757,27 +3934,42 @@ impl AppView {
         )
     }
 
-    /// Running games without a launcher manifest share the local games section.
-    /// Cached art falls back to the name-initial tile until prefetch completes.
+    /// Games page: a header with live counts, then the installed/running
+    /// games and the rest of the catalog as grids of poster cards. Cached art
+    /// falls back to a name-initial tile until prefetch completes.
     fn render_games(&self, cx: &mut Context<Self>) -> AnyElement {
         let (installed, rest): (Vec<&Game>, Vec<&Game>) =
             self.games.iter().partition(|g| g.installed || g.running);
+        let running = self.games.iter().filter(|g| g.running).count();
+        let profiles = self.games.iter().filter(|g| self.profiles.has_any(&g.id)).count();
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let subtitle = {
+            let mut parts = vec![format!("{} installed", installed.len())];
+            if running > 0 {
+                parts.push(format!("{running} running"));
+            }
+            parts.push(format!("{profiles} with a profile"));
+            parts.join(" · ")
+        };
         div()
             .flex()
             .flex_col()
             .size_full()
-            .p_4()
-            .gap_3()
+            .px_6()
+            .py_5()
+            .gap_6()
             .overflow_y_scrollbar()
             .child(
                 div()
-                    .text_xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().foreground)
-                    .child("Games"),
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(fg).child("Games"))
+                    .child(div().text_sm().text_color(muted).child(subtitle)),
             )
-            .child(self.render_game_section(cx, "Installed & Running", &installed, false))
-            .child(self.render_game_section(cx, "More Games", &rest, true))
+            .child(self.render_game_section(cx, "Installed & running", "Pick a game to give it its own mouse profile.", &installed, false))
+            .child(self.render_game_section(cx, "More games", "Not found on this PC. Profiles you set up still apply once they are installed.", &rest, true))
             .into_any_element()
     }
 
@@ -3785,25 +3977,48 @@ impl AppView {
         &self,
         cx: &mut Context<Self>,
         title: &str,
+        blurb: &str,
         games: &[&Game],
         muted: bool,
     ) -> AnyElement {
         if games.is_empty() {
             return div().into_any_element();
         }
+        let fg = cx.theme().foreground;
+        let subtle = cx.theme().muted_foreground;
+        let border = cx.theme().border;
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("{title} ({})", games.len())),
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .gap_2()
+                            .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(fg).child(title.to_string()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(Hsla { a: 0.08, ..fg })
+                                    .text_color(subtle)
+                                    .child(games.len().to_string()),
+                            ),
+                    )
+                    .child(div().text_sm().text_color(subtle).child(blurb.to_string())),
             )
+            .child(div().h(px(1.)).w_full().bg(Hsla { a: 0.7, ..border }))
             .child(
-                div().flex().flex_row().flex_wrap().gap_3().children(
+                div().flex().flex_row().flex_wrap().gap_4().children(
                     games
                         .iter()
                         .map(|game| self.render_game_card(cx, game, muted)),
@@ -3812,40 +4027,43 @@ impl AppView {
             .into_any_element()
     }
 
-    /// One game card: cached art (or initial tile), name, and detected statuses.
+    /// One poster card: art on top, then the name and status badges. A running
+    /// game gets an accent outline; games not installed are dimmed.
     fn render_game_card(&self, cx: &mut Context<Self>, game: &Game, muted: bool) -> AnyElement {
+        const CARD_W: f32 = 148.;
+        const ART_H: f32 = 200.;
+        let fg = cx.theme().foreground;
+        let accent = cx.theme().primary;
+        let border = cx.theme().border;
         // Cached file art when prefetched, else the name-initial tile.
         // Remote `img(url)` is not used: desktop GPUI ships no HTTP client
         // (`with_http_client` is web-backend-only), so URLs would stay blank.
         let art = match crate::games::cached_art_path(game) {
             Some(path) => div()
-                .w(px(120.))
-                .h(px(180.))
-                .rounded_lg()
+                .w_full()
+                .h(px(ART_H))
                 .overflow_hidden()
                 .child(
                     // PathBuf (not String): String routes to the embedded
                     // asset bundle and misses; PathBuf reads the file.
-                    img(path).w_full().h_full().object_fit(ObjectFit::Contain),
+                    img(path).w_full().h_full().object_fit(ObjectFit::Cover),
                 )
                 .into_any_element(),
             None => div()
-                .w(px(120.))
-                .h(px(180.))
-                .rounded_lg()
-                .bg(cx.theme().muted)
+                .w_full()
+                .h(px(ART_H))
+                .flex()
                 .items_center()
                 .justify_center()
-                .text_xl()
+                .bg(Hsla { a: 0.10, ..accent })
+                .text_size(px(40.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(cx.theme().background)
+                .text_color(Hsla { a: 0.7, ..accent })
                 .child(game.mark().to_string())
                 .into_any_element(),
         };
         let game_id = game.id.clone();
         let has_profile = self.profiles.has_any(&game.id);
-        let accent = cx.theme().primary;
-        let ink = cx.theme().foreground;
         div()
             .id(SharedString::from(format!("game-{}", game.id)))
             .cursor_pointer()
@@ -3856,33 +4074,46 @@ impl AppView {
             }))
             .flex()
             .flex_col()
-            .w(px(120.))
+            .w(px(CARD_W))
             .flex_shrink_0()
-            .gap_1p5()
-            .opacity(if muted && !game.running { 0.55 } else { 1.0 })
+            .rounded_xl()
+            .overflow_hidden()
+            .border_1()
+            .border_color(if game.running { Hsla { a: 0.8, ..accent } } else { Hsla { a: 0.7, ..border } })
+            .bg(Hsla { a: 0.04, ..fg })
+            .hover(move |card| card.bg(Hsla { a: 0.08, ..fg }).border_color(Hsla { a: 0.55, ..accent }))
+            .opacity(if muted && !game.running { 0.6 } else { 1.0 })
             .child(art)
             .child(
                 div()
-                    .w_full()
-                    .min_w_0()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(cx.theme().foreground)
-                    .child(game.name.clone()),
-            )
-            .child(
-                div()
                     .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_1()
-                    .when(game.running, |row| {
-                        row.child(accent_badge("Running", accent, ink))
-                    })
-                    .when(game.installed, |row| {
-                        row.child(Tag::secondary().small().child("Installed"))
-                    })
-                    .when(has_profile, |row| row.child(accent_badge("Profile", accent, ink))),
+                    .flex_col()
+                    .gap_1p5()
+                    .p_2p5()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .h(px(32.))
+                            .overflow_hidden()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(fg)
+                            .child(game.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_1()
+                            .h(px(20.))
+                            .when(game.running, |row| row.child(accent_badge("Running", accent, fg)))
+                            .when(game.installed && !game.running, |row| {
+                                row.child(Tag::secondary().small().child("Installed"))
+                            })
+                            .when(has_profile, |row| row.child(accent_badge("Profile", accent, fg))),
+                    ),
             )
             .into_any_element()
     }
@@ -4433,13 +4664,24 @@ impl Render for AppView {
         };
         let toast = self.render_toast(cx);
         let ascii = self.render_ascii_background(window, cx);
-        div().relative().size_full().children(toast).child(ascii).child(
+        // The sidebar's tint and divider run the window's full height, behind
+        // the title bar too; the sidebar itself is transparent over it.
+        let sidebar_backdrop = div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .h_full()
+            .w(px(if self.sidebar_collapsed { SIDEBAR_COLLAPSED_W } else { SIDEBAR_W }))
+            .border_r_1()
+            .border_color(Hsla { a: 0.7, ..cx.theme().border })
+            .bg(Hsla { a: 0.35, ..cx.theme().sidebar });
+        div().relative().size_full().children(toast).child(ascii).child(sidebar_backdrop).child(
             div()
                 .flex()
                 .flex_col()
                 .size_full()
                 .text_color(cx.theme().foreground)
-                .child(TitleBar::new().bg(clear).child(self.render_titlebar(cx)))
+                .child(TitleBar::new().bg(clear).border_b_0().child(self.render_titlebar(cx)))
                 .child(
                     div()
                         .flex()
