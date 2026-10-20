@@ -143,6 +143,7 @@ fn on_tray_icon_event(tray: &TrayIcon<Wry>, event: tauri::tray::TrayIconEvent) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
@@ -172,6 +173,7 @@ pub fn run() {
             applog::log_line,
             games::running_process_names,
             games::scan_installed_games,
+            games::app_icon_png,
             conflicting_apps::detect_conflicting_apps,
             resource_monitor::sample_resource_usage,
             linux_permissions::install_udev_rules,

@@ -1,9 +1,11 @@
 import { useEffect, useState } from "preact/hooks";
-import { SlidersHorizontal, Zap, Download } from "lucide-preact";
+import { SlidersHorizontal, Zap, Download, Plus, X } from "lucide-preact";
 import type { MouseConnection } from "../hooks/use-mouse-connection";
 import type { Game, GameWatcher } from "../hooks/use-game-watcher";
-import { subscribeGameProfiles, type GameProfile } from "../lib/game-profiles";
+import { clearGameProfile, subscribeGameProfiles, type GameProfile } from "../lib/game-profiles";
+import { removeCustomGame } from "../lib/custom-games";
 import { GameProfilePanel } from "../components/GameProfilePanel";
+import { AddCustomGameModal } from "../components/AddCustomGameModal";
 
 export type { Game };
 
@@ -16,6 +18,7 @@ export function GamesPage({ connection, watcher }: Props) {
   const { list, runningProcesses } = watcher;
   const [profiles, setProfiles] = useState<Record<string, GameProfile>>({});
   const [editingGame, setEditingGame] = useState<Game | null>(null);
+  const [addingApp, setAddingApp] = useState(false);
 
   // Saved profiles live in module-level storage (lib/game-profiles.ts), not
   // component state — subscribe so this page re-renders (the auto-apply
@@ -29,8 +32,14 @@ export function GamesPage({ connection, watcher }: Props) {
   const loading = list.status === "loading";
   const error = list.status === "error" ? list.message : "";
   const games = list.status === "loaded" ? list.games : [];
-  const installedGames = games.filter((g) => g.installed);
-  const notInstalledGames = games.filter((g) => !g.installed);
+  const installedGames = games.filter((g) => g.installed && !g.custom);
+  const notInstalledGames = games.filter((g) => !g.installed && !g.custom);
+  const customGames = games.filter((g) => g.custom);
+
+  function removeCustom(game: Game) {
+    removeCustomGame(game.id);
+    clearGameProfile(game.id);
+  }
 
   // Full page, not a modal over the grid — same pattern OverviewPage uses
   // for its list/device split, so editing a profile gets the same room a
@@ -43,6 +52,14 @@ export function GamesPage({ connection, watcher }: Props) {
         game={editingGame}
         connection={connection}
         onClose={() => setEditingGame(null)}
+        onRemove={
+          editingGame.custom
+            ? () => {
+                removeCustom(editingGame);
+                setEditingGame(null);
+              }
+            : undefined
+        }
       />
     );
   }
@@ -71,9 +88,26 @@ export function GamesPage({ connection, watcher }: Props) {
           </div>
         </>
       )}
-      {!loading && !error && notInstalledGames.length > 0 && (
+      {!loading && !error && (
         <>
-          <h2 class="games-section-title games-section-more">More Games ({notInstalledGames.length})</h2>
+          <h2 class="games-section-title games-section-more">
+            More Games ({notInstalledGames.length + customGames.length})
+          </h2>
+          {/* Its own unmuted grid: custom apps are on this machine by
+              definition, and the add tile needs to read as clickable. */}
+          <div class="games-grid games-grid-custom">
+            {customGames.map((game) => (
+              <GameCard
+                key={game.id}
+                game={game}
+                running={isRunning(game)}
+                profile={profiles[game.id]}
+                onEditProfile={() => setEditingGame(game)}
+                onRemove={() => removeCustom(game)}
+              />
+            ))}
+            <AddCustomGameCard onClick={() => setAddingApp(true)} />
+          </div>
           <div class="games-grid games-grid-muted">
             {notInstalledGames.map((game) => (
               <GameCard
@@ -87,7 +121,31 @@ export function GamesPage({ connection, watcher }: Props) {
           </div>
         </>
       )}
+      {addingApp && (
+        <AddCustomGameModal
+          games={games}
+          runningProcesses={runningProcesses}
+          onClose={() => setAddingApp(false)}
+          onAdded={(game, editProfile) => {
+            setAddingApp(false);
+            if (editProfile) setEditingGame(game);
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+function AddCustomGameCard({ onClick }: { onClick: () => void }) {
+  return (
+    <button type="button" class="game-card game-card-add" onClick={onClick}>
+      <div class="game-card-mark game-card-add-mark" aria-hidden="true">
+        <Plus size={28} />
+      </div>
+      <div class="game-card-content">
+        <h2>Add application</h2>
+      </div>
+    </button>
   );
 }
 
@@ -96,15 +154,17 @@ function GameCard({
   running,
   profile,
   onEditProfile,
+  onRemove,
 }: {
   game: Game;
   running: boolean;
   profile?: GameProfile;
   onEditProfile: () => void;
+  onRemove?: () => void;
 }) {
   return (
     <article
-      class={`game-card ${running ? "detected" : ""} ${game.installed ? "" : "game-card-not-installed"}`}
+      class={`game-card ${running ? "detected" : ""} ${game.installed || game.custom ? "" : "game-card-not-installed"}`}
       key={game.id}
       onClick={onEditProfile}
       role="button"
@@ -121,6 +181,10 @@ function GameCard({
           <div class="game-card-art-split">
             <img src={game.artwork} alt="" loading="lazy" />
             <img src={game.artworkSecondary} alt="" loading="lazy" />
+          </div>
+        ) : game.icon ? (
+          <div class="game-card-mark game-card-icon-mark" aria-hidden="true">
+            <img src={game.icon} alt="" />
           </div>
         ) : game.steamAppId || game.artwork ? (
           <img
@@ -144,6 +208,21 @@ function GameCard({
             {game.name.slice(0, 1)}
           </div>
         )}
+        {onRemove && (
+          <button
+            type="button"
+            class="game-card-remove"
+            title={`Remove ${game.name}`}
+            aria-label={`Remove ${game.name}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onRemove();
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <X size={12} />
+          </button>
+        )}
         {running && (
           <span class="game-card-running-badge">
             <span class="game-card-running-dot" aria-hidden="true" /> Running
@@ -157,7 +236,7 @@ function GameCard({
       </div>
       <div class="game-card-content">
         <div class="game-card-title-row">
-          <h2>{game.name}</h2>
+          <h2 title={game.path}>{game.name}</h2>
           <span class="game-card-profile-button" title="Configure a device profile for this game" aria-hidden="true">
             {profile?.autoApply && <Zap size={11} class="game-card-profile-auto-icon" aria-hidden="true" />}
             <SlidersHorizontal size={13} />

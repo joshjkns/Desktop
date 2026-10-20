@@ -23,6 +23,7 @@ import {
 } from "../lib/game-profiles";
 import { showToast } from "../lib/toast";
 import { showOverlayToast } from "../lib/overlay-toast";
+import { subscribeCustomGames, toGame, type CustomGame } from "../lib/custom-games";
 
 export interface Game {
   id: string;
@@ -41,6 +42,12 @@ export interface Game {
   artworkSecondary?: string;
   executables: string[];
   installed?: boolean;
+  /** User-added via the Games page (lib/custom-games.ts), not games.json. */
+  custom?: boolean;
+  /** Path the user picked for a custom entry. Display only. */
+  path?: string;
+  /** App icon (data URL) for a custom entry, shown instead of cover art. */
+  icon?: string;
 }
 
 interface GamesFile {
@@ -168,6 +175,19 @@ export function useGameWatcher(connection: MouseConnection) {
   // `applyOnLaunch`'s return value. Retried by `poll()` until they land (or
   // the game closes first), instead of being dropped for the whole session.
   const pendingLaunchRef = useRef<Set<string>>(new Set());
+  // games.json (with install status) and the user's custom entries load
+  // independently; the list everything else sees is always the two merged.
+  const [catalogGames, setCatalogGames] = useState<Game[] | null>(null);
+  const [customGames, setCustomGames] = useState<CustomGame[]>([]);
+
+  useEffect(() => subscribeCustomGames(setCustomGames), []);
+
+  useEffect(() => {
+    if (!catalogGames) return;
+    const allGames = [...catalogGames, ...customGames.map(toGame)];
+    gamesRef.current = allGames;
+    setList({ status: "loaded", games: allGames });
+  }, [catalogGames, customGames]);
 
   useEffect(() => {
     fetchGamesFile()
@@ -200,10 +220,7 @@ export function useGameWatcher(connection: MouseConnection) {
         // Installed games first, then not-installed
         const installed = gamesWithInstallStatus.filter((g) => g.installed);
         const notInstalled = gamesWithInstallStatus.filter((g) => !g.installed);
-        const allGames = [...installed, ...notInstalled];
-
-        gamesRef.current = allGames;
-        setList({ status: "loaded", games: allGames });
+        setCatalogGames([...installed, ...notInstalled]);
       })
       .catch((reason: unknown) => {
         setList({ status: "error", message: reason instanceof Error ? reason.message : String(reason) });

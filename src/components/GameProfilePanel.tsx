@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import { ArrowLeft, Trash2, Zap } from "lucide-preact";
+import { ArrowLeft, Trash2, X, Zap } from "lucide-preact";
 import type { Game } from "../hooks/use-game-watcher";
 import type { MouseConnection } from "../hooks/use-mouse-connection";
 import type { CandidateInterface } from "../native-hid/scan";
@@ -21,6 +21,8 @@ interface Props {
   game: Game;
   connection: MouseConnection;
   onClose: () => void;
+  /** Only for user-added apps (lib/custom-games.ts): removes it from the Games page. */
+  onRemove?: () => void;
 }
 
 /**
@@ -52,7 +54,7 @@ interface Props {
  * all." Every other toggle in this app (Discord RPC, Mode) already applies
  * on change, not on a separate save step; this matches.
  */
-export function GameProfilePanel({ game, connection, onClose }: Props) {
+export function GameProfilePanel({ game, connection, onClose, onRemove }: Props) {
   const existing = getGameProfile(game.id);
   const { connected, connectedInfo, list, connectingKey, select } = connection;
   const status = connected?.status;
@@ -223,6 +225,10 @@ export function GameProfilePanel({ game, connection, onClose }: Props) {
               <img src={game.artwork} alt="" />
               <img src={game.artworkSecondary} alt="" />
             </div>
+          ) : game.icon ? (
+            <div class="profile-hero-art profile-hero-art-fallback profile-hero-art-icon" aria-hidden="true">
+              <img src={game.icon} alt="" />
+            </div>
           ) : game.steamAppId || game.artwork ? (
             <img
               class="profile-hero-art"
@@ -256,6 +262,11 @@ export function GameProfilePanel({ game, connection, onClose }: Props) {
               <button class="rescan-button" onClick={() => void handleApplyNow()} disabled={!canApplyNow}>
                 <Zap size={14} /> {pending === "apply" ? "Applying…" : "Apply now"}
               </button>
+              {onRemove && (
+                <button class="rescan-button profile-remove-app" onClick={onRemove} disabled={busy}>
+                  <X size={14} /> Remove
+                </button>
+              )}
             </div>
           </div>
         </div>

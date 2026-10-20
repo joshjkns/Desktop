@@ -34,6 +34,24 @@ pub fn running_process_names(state: tauri::State<'_, ProcessListState>) -> Vec<S
         .collect()
 }
 
+/// The OS's own icon for a user-added application (an `.exe`, a macOS
+/// `.app` bundle, ...), PNG-encoded — the Games page shows it as the card art
+/// for custom entries, which have no games.json artwork. Sync on purpose:
+/// sync commands run on the main thread, which `get_file_icon` requires on
+/// Linux.
+#[tauri::command]
+pub fn app_icon_png(path: String) -> Result<Vec<u8>, String> {
+    const SIZE: u16 = 256;
+    let icon = file_icon_provider::get_file_icon(&path, SIZE).map_err(|e| e.to_string())?;
+    let image = image::RgbaImage::from_raw(icon.width, icon.height, icon.pixels)
+        .ok_or("icon buffer didn't match its dimensions")?;
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(png)
+}
+
 // ---------------------------------------------------------------------------
 // Steam library parsing (libraryfolders.vdf + appmanifest_*.acf)
 // ---------------------------------------------------------------------------
