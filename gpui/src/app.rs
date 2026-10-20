@@ -15,6 +15,112 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::time::Duration;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Background art: a static ASCII density ramp painted behind the shell.
+/// Deterministic (no RNG, no animation), and only regenerated when the
+/// window's character grid changes size.
+const ASCII_RAMP: &[u8] = b" .:-=+*x#%@";
+/// Cell width as a fraction of the font size. A monospace advance is ~0.6em;
+/// deliberately under that, so the trailing columns overflow the window and
+/// get clipped instead of leaving a strip of bare background on the right.
+const ASCII_CELL_RATIO: f32 = 0.57;
+/// Ink opacity at the corner the field starts from.
+const ASCII_ALPHA: f32 = 0.09;
+/// The field slides back in from the right whenever the theme changes.
+const ASCII_SWEEP_MS: u64 = 520;
+/// How far a row starts to the right of its resting place, in px.
+const ASCII_SWEEP_OFFSET: f32 = 220.0;
+/// Share of the sweep spent waiting for the wave to reach the last row, so
+/// rows arrive top-down instead of all at once.
+const ASCII_SWEEP_STAGGER: f32 = 0.55;
+/// How far the falloff reaches, as a fraction of the corner-to-opposite
+/// corner distance.
+const ASCII_FADE_REACH: f32 = 0.9;
+
+/// Number of alpha bands per row; each is its own text run.
+const ASCII_BANDS: usize = 6;
+
+/// Falloff from the top-right corner, slightly wider than tall. `u` runs
+/// left→right, `v` top→bottom; returns 0..1.
+fn ascii_falloff(u: f32, v: f32) -> f32 {
+    let dx = 1.0 - u;
+    let distance = (dx * dx + v * v * 0.8).sqrt();
+    let s = (1.0 - distance / ASCII_FADE_REACH).clamp(0.0, 1.0);
+    // Smoothstep: no hard edge where the field reaches zero.
+    s * s * (3.0 - 2.0 * s)
+}
+
+/// Ink opacity for one cell region. The alpha fades out with the density in
+/// both directions, so the gradient dims the layer instead of veiling the
+/// whole window at one flat opacity.
+fn ascii_cell_alpha(u: f32, v: f32) -> f32 {
+    ASCII_ALPHA * ascii_falloff(u, v).sqrt()
+}
+
+/// Deterministic lattice hash → 0..1.
+fn ascii_hash(x: i32, y: i32) -> f32 {
+    let mut h = (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297A_2D39);
+    h ^= h >> 15;
+    (h & 0xFFFF) as f32 / 65535.0
+}
+
+/// Smooth value noise, 0..1.
+fn ascii_value_noise(x: f32, y: f32) -> f32 {
+    let (xi, yi) = (x.floor(), y.floor());
+    let (fx, fy) = (x - xi, y - yi);
+    let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+    let (xi, yi) = (xi as i32, yi as i32);
+    let top = ascii_hash(xi, yi) + (ascii_hash(xi + 1, yi) - ascii_hash(xi, yi)) * sx;
+    let bottom = ascii_hash(xi, yi + 1) + (ascii_hash(xi + 1, yi + 1) - ascii_hash(xi, yi + 1)) * sx;
+    top + (bottom - top) * sy
+}
+
+/// Three-octave fractal noise, 0..1, in cell units (cells are ~2x taller
+/// than wide, so `y` is scaled harder than `x`).
+fn ascii_fbm(x: f32, y: f32) -> f32 {
+    let (mut sum, mut amp, mut freq, mut norm) = (0.0, 1.0, 1.0, 0.0);
+    for octave in 0..3 {
+        let o = octave as f32 * 17.0;
+        sum += amp * ascii_value_noise(x * freq + o, y * freq - o);
+        norm += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    sum / norm
+}
+
+/// Interleaved gradient noise, 0..1: an unstructured dither without the
+/// visible grid a Bayer matrix leaves on flat areas.
+fn ascii_dither(x: usize, y: usize) -> f32 {
+    (52.982_92 * ((0.067_110_56 * x as f32 + 0.005_837_15 * y as f32).fract())).fract()
+}
+
+/// Build one character row per screen row. Density is highest at the
+/// top-right corner and falls away toward the bottom-left; fractal noise
+/// breaks the gradient into cloud-like contours instead of a clean radial.
+fn ascii_background_rows(cols: usize, rows: usize) -> Vec<SharedString> {
+    let last = (ASCII_RAMP.len() - 1) as f32;
+    let mut out = Vec::with_capacity(rows);
+    for y in 0..rows {
+        let v = (y as f32 + 0.5) / rows as f32;
+        let mut line = String::with_capacity(cols);
+        for x in 0..cols {
+            let u = (x as f32 + 0.5) / cols as f32;
+            let cloud = ascii_fbm(x as f32 * 0.07, y as f32 * 0.14);
+            let t = (ascii_falloff(u, v) * (0.3 + 1.2 * cloud)).clamp(0.0, 1.0).powf(1.25);
+            let dithered = t * last + (ascii_dither(x, y) - 0.5) * 0.9;
+            let index = dithered.round().clamp(0.0, last) as usize;
+            line.push(ASCII_RAMP[index] as char);
+        }
+        out.push(line.into());
+    }
+    out
+}
+
 /// Release stage label shown in the titlebar badge, mirroring
 /// `stageForVersion` in `src/lib/version-stage.ts`: 0.x → Alpha,
 /// 1.x → Beta, 2.x+ → Public.
@@ -375,17 +481,38 @@ pub struct AppView {
     slider_seq: u64,
     _subscriptions: Vec<Subscription>,
     _game_watcher: Option<crate::game_watcher::GameWatcher>,
+    /// Cached ASCII background rows, keyed by their grid dimensions.
+    ascii_rows: Vec<SharedString>,
+    ascii_dims: (usize, usize),
+    /// Bumped on every theme change; the ASCII field's animation id carries
+    /// it, so each switch replays the entrance.
+    theme_seq: u64,
 }
 
 /// Theme swatches in Settings, in display order. Narrows the web app's seven
-/// presets to the four in scope: System follow + Matt dark/light + Dynamic.
-/// (Emerald/Violet/Ice/Mono + custom CSS stay web-only for now.)
-const THEME_CHOICES: [ThemeChoice; 4] = [
+/// presets to the five in scope: System follow + Matt dark + OLED dark +
+/// Matt light + Dynamic. (Emerald/Violet/Ice/Mono + custom CSS stay web-only
+/// for now.)
+const THEME_CHOICES: [ThemeChoice; 5] = [
     ThemeChoice::System,
     ThemeChoice::Dark,
+    ThemeChoice::Oled,
     ThemeChoice::Light,
     ThemeChoice::Dynamic,
 ];
+
+/// Accent swatches in Settings: (label, hue in degrees).
+const ACCENT_SWATCHES: [(&str, f32); 8] = [
+    ("Red", 0.0),
+    ("Orange", 25.0),
+    ("Yellow", 48.0),
+    ("Green", 130.0),
+    ("Teal", 175.0),
+    ("Blue", 215.0),
+    ("Purple", 265.0),
+    ("Pink", 330.0),
+];
+const ACCENT_SWATCH_SIZE: f32 = 28.0;
 
 impl AppView {
     /// Build the root view, owning the Settings sliders. Call from the
@@ -487,6 +614,9 @@ impl AppView {
             slider_seq: 0,
             _subscriptions: vec![sub_opacity, sub_vibrancy, sub_activity],
             _game_watcher: Some(game_watcher),
+            ascii_rows: Vec::new(),
+            ascii_dims: (0, 0),
+            theme_seq: 0,
         };
         // The OS entry is the truth for launch-on-startup, not the saved flag.
         view.profiles = crate::profiles::Profiles::load();
@@ -535,6 +665,9 @@ impl Default for AppView {
             vibrancy_slider: None,
             _subscriptions: Vec::new(),
             _game_watcher: None,
+            ascii_rows: Vec::new(),
+            ascii_dims: (0, 0),
+            theme_seq: 0,
         }
     }
 }
@@ -1474,6 +1607,8 @@ impl AppView {
     /// `force` refresh) instead of showing the fallback until the 2s watcher
     /// tick lands.
     pub fn set_theme(&mut self, theme: ThemeChoice, window: &mut Window, cx: &mut Context<Self>) {
+        // Palette before the switch, for the crossfade below.
+        let previous = cx.theme().colors;
         self.settings.theme = theme;
         self.settings.save();
         if theme == ThemeChoice::Dynamic {
@@ -1488,6 +1623,7 @@ impl AppView {
                     Some(accent),
                     vibrancy,
                     self.settings.window_opacity / 100.0,
+                    self.settings.accent,
                     Some(window),
                     cx,
                 );
@@ -1511,6 +1647,7 @@ impl AppView {
                             Some(accent),
                             vibrancy,
                             view.settings.window_opacity / 100.0,
+                            view.settings.accent,
                             None,
                             cx,
                         );
@@ -1522,6 +1659,27 @@ impl AppView {
         } else {
             self.repaint_theme(Some(window), cx);
         }
+        // The new palette is live; fade into it, and replay the art's
+        // entrance so the field slides back in from the side.
+        self.theme_seq += 1;
+        crate::theme::crossfade_colors(previous, cx.theme().colors, cx);
+        cx.notify();
+    }
+
+    /// Set (or clear) the user's accent override. The palette fades to it and
+    /// the ASCII field replays its entrance, exactly like a theme switch.
+    pub fn set_accent(
+        &mut self,
+        accent: Option<(u8, u8, u8)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.accent = accent;
+        self.settings.save();
+        let previous = cx.theme().colors;
+        self.repaint_theme(Some(window), cx);
+        self.theme_seq += 1;
+        crate::theme::crossfade_colors(previous, cx.theme().colors, cx);
         cx.notify();
     }
 
@@ -1541,14 +1699,20 @@ impl AppView {
         // instead of flashing fallback green (mirrors DYNAMIC_HEX_KEY).
         self.settings.dynamic_hex = Some(accent);
         self.settings.save();
+        let previous = cx.theme().colors;
         crate::theme::apply_choice(
             ThemeChoice::Dynamic,
             Some(accent),
             self.settings.dynamic_vibrancy,
             self.settings.window_opacity / 100.0,
+            self.settings.accent,
             None,
             cx,
         );
+        // A new wallpaper is a new palette: fade it in, and replay the art's
+        // entrance like a theme switch.
+        self.theme_seq += 1;
+        crate::theme::crossfade_colors(previous, cx.theme().colors, cx);
         cx.notify();
     }
 
@@ -1566,6 +1730,7 @@ impl AppView {
             wallpaper,
             self.settings.dynamic_vibrancy,
             self.settings.window_opacity / 100.0,
+            self.settings.accent,
             window,
             cx,
         );
@@ -1723,6 +1888,119 @@ impl AppView {
                 )
                 .child(Icon::new(IconName::ChevronRight).size(px(14.)).text_color(muted))
             })
+    }
+
+    /// Subtle ASCII field behind the whole shell. Rows are cached by grid
+    /// size; the accent color is applied at paint time, so switching themes
+    /// recolors the field without regenerating it. A theme change also
+    /// replays the entrance — the art itself carries the transition, sliding
+    /// back in from the right with the top row arriving first.
+    fn render_ascii_background(&mut self, window: &Window, cx: &Context<Self>) -> AnyElement {
+        // Kit's mono family resolves per platform (Menlo / Consolas /
+        // DejaVu) and falls back to an installed family, so the grid always
+        // has a real monospace face whose advance it can rely on.
+        let font_size = cx.theme().mono_font_size;
+        let line_height = font_size.as_f32();
+        let viewport = window.viewport_size();
+        let cols = ((viewport.width.as_f32() / (line_height * ASCII_CELL_RATIO)).ceil() as usize).max(1);
+        let grid_rows = ((viewport.height.as_f32() / line_height).ceil() as usize).max(1);
+        if self.ascii_dims != (cols, grid_rows) {
+            self.ascii_rows = ascii_background_rows(cols, grid_rows);
+            self.ascii_dims = (cols, grid_rows);
+        }
+        let font_family = cx.theme().mono_font_family.clone();
+        let color = cx.theme().primary;
+        let total = self.ascii_rows.len();
+        let rows: Vec<(SharedString, f32)> = self
+            .ascii_rows
+            .iter()
+            .enumerate()
+            .map(|(index, line)| (line.clone(), (index as f32 + 0.5) / total as f32))
+            .collect();
+        div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .w_full()
+            .h_full()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .with_animation(
+                // The id carries the theme generation: a new one restarts the
+                // entrance instead of leaving the field parked mid-frame.
+                format!("ascii-field-{}", self.theme_seq),
+                Animation::new(Duration::from_millis(ASCII_SWEEP_MS)),
+                move |field, delta| {
+                    field.children(rows.iter().map(|(line, position)| {
+                        // The wave reaches each row in turn; a row holds its
+                        // start offset until then.
+                        let local = ((delta - position * ASCII_SWEEP_STAGGER)
+                            / (1.0 - ASCII_SWEEP_STAGGER))
+                            .clamp(0.0, 1.0);
+                        let eased = 1.0 - (1.0 - local).powi(3);
+                        div()
+                            .h(px(line_height))
+                            .flex_none()
+                            .left(px((1.0 - eased) * ASCII_SWEEP_OFFSET))
+                            .font_family(font_family.clone())
+                            .text_size(font_size)
+                            .line_height(px(line_height))
+                            .whitespace_nowrap()
+                            .child(div().flex().flex_none().children(
+                                (0..ASCII_BANDS).filter_map(|band| {
+                                    let start = band * line.len() / ASCII_BANDS;
+                                    let end = (band + 1) * line.len() / ASCII_BANDS;
+                                    if start == end {
+                                        return None;
+                                    }
+                                    let u = ((start + end) as f32 * 0.5) / line.len() as f32;
+                                    Some(
+                                        div()
+                                            .flex_none()
+                                            .text_color(Hsla {
+                                                a: ascii_cell_alpha(u, *position),
+                                                ..color
+                                            })
+                                            .child(SharedString::from(line[start..end].to_string())),
+                                    )
+                                }),
+                            ))
+                    }))
+                },
+            )
+            .into_any_element()
+    }
+
+    /// Accent selector: a row of basic color swatches. Each swatch is its own
+    /// hit target; the one matching the stored accent gets a ring.
+    fn render_accent_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selected_accent = self.settings.accent;
+        h_flex()
+            .items_center()
+            .gap_2()
+            .children(ACCENT_SWATCHES.iter().enumerate().map(|(index, (_, hue))| {
+                let hue = *hue;
+                let value = crate::theme::picked_accent(hue);
+                let selected = selected_accent == Some(value);
+                div()
+                    .id(("accent-swatch", index))
+                    .flex_none()
+                    .size(px(ACCENT_SWATCH_SIZE))
+                    .rounded_full()
+                    .bg(crate::theme::picked_accent_hsla(hue))
+                    .border_2()
+                    .border_color(if selected {
+                        cx.theme().foreground
+                    } else {
+                        Hsla { a: 0.0, ..cx.theme().foreground }
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_accent(Some(value), window, cx);
+                    }))
+            }))
+            .into_any_element()
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3774,9 +4052,18 @@ impl AppView {
                             RadioGroup::horizontal("theme-choice")
                                 .children(THEME_CHOICES.into_iter().map(|choice| {
                                     let description = match choice {
-                                        ThemeChoice::System => "Follow macOS",
-                                        ThemeChoice::Dark => "Warm and muted",
-                                        ThemeChoice::Light => "Bright and clear",
+                                        ThemeChoice::System => {
+                                            if cfg!(target_os = "macos") {
+                                                "Follow macOS"
+                                            } else if cfg!(target_os = "windows") {
+                                                "Follow Windows"
+                                            } else {
+                                                "Follow system"
+                                            }
+                                        }
+                                        ThemeChoice::Dark => "Warm, muted",
+                                        ThemeChoice::Oled => "True black",
+                                        ThemeChoice::Light => "Bright, clear",
                                         ThemeChoice::Dynamic => "From wallpaper",
                                     };
                                     Radio::new(choice.label())
@@ -3807,6 +4094,41 @@ impl AppView {
                                         this.set_theme(*choice, window, cx);
                                     }
                                 })),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Accent color"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Override the theme's accent, or reset to use the theme's own."),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(self.render_accent_picker(cx))
+                                        .when(self.settings.accent.is_some(), |row| {
+                                            row.child(
+                                                Button::new("accent-reset")
+                                                    .compact()
+                                                    .label("Reset")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.set_accent(None, window, cx);
+                                                    })),
+                                            )
+                                        }),
+                                ),
                         )
                         .child(div().h(px(1.)).w_full().bg(cx.theme().border))
                         .child(self.render_effect_slider(
@@ -4110,7 +4432,8 @@ impl Render for AppView {
             ..cx.theme().background
         };
         let toast = self.render_toast(cx);
-        div().relative().size_full().children(toast).child(
+        let ascii = self.render_ascii_background(window, cx);
+        div().relative().size_full().children(toast).child(ascii).child(
             div()
                 .flex()
                 .flex_col()
