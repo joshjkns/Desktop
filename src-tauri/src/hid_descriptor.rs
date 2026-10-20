@@ -79,14 +79,6 @@ impl ReportLayout {
             self.output_bits.contains_key(&report_id)
         }
     }
-
-    /// True when this interface declares `report_id` as an input report — i.e.
-    /// an answer to it could arrive here. The direction a *response* uses is
-    /// not always the direction the request used, so reads consult this
-    /// separately from `declares`.
-    pub fn declares_input(&self, report_id: u8) -> bool {
-        self.input_bits.contains_key(&report_id)
-    }
 }
 
 /// hidapi's own descriptor ceiling; larger reports are rejected as malformed
